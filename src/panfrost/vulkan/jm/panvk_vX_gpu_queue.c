@@ -45,8 +45,27 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
 
    /* Reset the batch if it's already been issued */
    if (batch->issued) {
-      util_dynarray_foreach(&batch->jobs, void *, job)
+      util_dynarray_foreach(&batch->jobs, void *, job) {
          memset((*job), 0, 4 * 4);
+
+#if PAN_ARCH >= 9
+         /* In memory-allocated IDVS mode, the hardware writes the vertex
+          * array pointer and strides of the fragment DCD. Restore them to
+          * what was emitted (packet bit only), otherwise the job is rejected
+          * with DATA_INVALID_FAULT when the batch is re-issued. */
+         pan_unpack((struct mali_job_header_packed *)(*job), JOB_HEADER, hdr);
+         if (hdr.type == MALI_JOB_TYPE_MALLOC_VERTEX) {
+            struct mali_draw_packed *dcd =
+               pan_section_ptr(*job, MALLOC_VERTEX_JOB, DRAW);
+            pan_unpack(dcd, DRAW, draw);
+            draw.vertex_array.pointer = 0;
+            draw.vertex_array.vertex_packet_stride = 0;
+            draw.vertex_array.vertex_attribute_stride = 0;
+            draw.vertex_array.packet = true;
+            MALI_DRAW_pack(dcd, &draw);
+         }
+#endif
+      }
 
       /* Reset the tiler before re-issuing the batch */
       if (batch->tiler.ctx_descs.cpu) {

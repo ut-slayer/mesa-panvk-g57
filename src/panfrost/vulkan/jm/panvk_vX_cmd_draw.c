@@ -2496,6 +2496,10 @@ panvk_draw_prepare_malloc_vertex_job(struct panvk_cmd_buffer *cmdbuf,
       pan_unpack(&draw->dcd_flags_1, DCD_FLAGS_1, flags_1);
       cfg.flags_0 = flags_0;
       cfg.flags_1 = flags_1;
+      /* Varyings live in vertex packets. In memory-allocated IDVS mode, the
+       * hardware writes the vertex array pointer and strides itself, but the
+       * packet bit must be set (Gallium does the same). */
+      cfg.vertex_array.packet = true;
       cfg.minimum_z = draw->z_min;
       cfg.maximum_z = draw->z_max;
       cfg.depth_stencil = draw->zsd;

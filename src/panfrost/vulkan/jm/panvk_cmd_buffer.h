@@ -59,6 +59,11 @@ struct panvk_batch {
    } tiler;
    struct pan_tls_info tlsinfo;
    unsigned wls_total_size;
+#if PAN_ARCH >= 9
+   /* Vertices (indices x instances x layers) issued by the direct draws of
+    * this batch. Used to split the batch before the tiler heap runs out. */
+   uint64_t vertex_count;
+#endif
    bool issued;
 };
 

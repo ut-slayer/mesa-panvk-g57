@@ -2653,13 +2653,31 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
       panvk_shader_only_variant(get_fs(cmdbuf));
    VkResult result;
 
+   /* On v9, the IDVS jobs allocate the vertex packets and the polygon lists
+    * of the whole batch from the tiler heap, which is only released when the
+    * fragment job runs. Unlike kbase, panfrost has no incremental rendering:
+    * when the heap is exhausted, the tiler job fails with an OOM fault and
+    * the draws are lost. Primitives scattered across the framebuffer use up
+    * to ~64 bytes of heap each (2M random points exhaust the 128 MiB heap),
+    * so split the batch, which spills and reloads the framebuffer, once it
+    * holds this many vertices. Indirect draws are counted as one vertex. */
+   const uint64_t max_batch_vertices = 1 << 20;
+   uint32_t draw_layers = cmdbuf->state.gfx.render.view_mask
+                             ? util_bitcount(cmdbuf->state.gfx.render.view_mask)
+                             : cmdbuf->state.gfx.render.layer_count;
+   uint64_t draw_vertices = (uint64_t)draw->info.vertex.count *
+                            draw->info.instance.count * MAX2(draw_layers, 1);
+
    /* There are only 16 bits in the descriptor for the job ID, and we need
     * one job per layer (two for indirect draws, which have a helper job). */
    if (batch->vtc_jc.job_index + 2 * cmdbuf->state.gfx.render.layer_count >=
-       UINT16_MAX) {
+          UINT16_MAX ||
+       (batch->vertex_count &&
+        batch->vertex_count + draw_vertices > max_batch_vertices)) {
       panvk_per_arch(cmd_close_batch)(cmdbuf);
       batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
    }
+   batch->vertex_count += draw_vertices;
 
    if (cmdbuf->state.gfx.vk_meta) {
       /* vk_meta doesn't care about the provoking vertex mode, we should use

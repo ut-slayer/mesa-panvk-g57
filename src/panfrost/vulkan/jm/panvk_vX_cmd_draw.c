@@ -257,11 +257,17 @@ set_provoking_vertex_mode(struct panvk_cmd_buffer *cmdbuf,
    struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
 
    if (first_provoking_vertex != U_TRISTATE_UNSET) {
-      /* If this is not the first draw, first_provoking_vertex should match
-       * the one from the previous draws. Unfortunately, we can't check it
-       * when the render pass is inherited. */
-      assert(state->render.first_provoking_vertex == U_TRISTATE_UNSET ||
-             state->render.first_provoking_vertex == first_provoking_vertex);
+      /* The provoking vertex mode lives in the tiler context and the FBD,
+       * which are per batch. If the application switches modes within a
+       * render pass (PPSSPP does), split the batch once its tiler context
+       * has been emitted with the previous mode. The split spills and
+       * reloads the framebuffer. */
+      if (state->render.first_provoking_vertex != U_TRISTATE_UNSET &&
+          state->render.first_provoking_vertex != first_provoking_vertex &&
+          cmdbuf->cur_batch && cmdbuf->cur_batch->tiler.ctx_descs.gpu) {
+         panvk_per_arch(cmd_close_batch)(cmdbuf);
+         panvk_per_arch(cmd_open_batch)(cmdbuf);
+      }
       state->render.first_provoking_vertex = first_provoking_vertex;
    }
 
@@ -1236,6 +1242,8 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
          VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT);
       set_provoking_vertex_mode(cmdbuf, first_provoking_vertex);
    }
+   /* Changing the provoking vertex mode may have split the batch. */
+   batch = cmdbuf->cur_batch;
 
    if (!rs->rasterizer_discard_enable) {
       ASSERTED const struct pan_fb_layout *fb =
@@ -2662,6 +2670,21 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
     * so split the batch, which spills and reloads the framebuffer, once it
     * holds this many vertices. Indirect draws are counted as one vertex. */
    const uint64_t max_batch_vertices = 1 << 20;
+
+   /* This may split the batch, so do it before the job and vertex budget
+    * checks below. */
+   if (cmdbuf->state.gfx.vk_meta) {
+      /* vk_meta doesn't care about the provoking vertex mode, we should use
+       * the same mode that the application uses. */
+      set_provoking_vertex_mode(cmdbuf, U_TRISTATE_UNSET);
+   } else {
+      enum u_tristate first_provoking_vertex = u_tristate_make(
+         cmdbuf->vk.dynamic_graphics_state.rs.provoking_vertex ==
+         VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT);
+      set_provoking_vertex_mode(cmdbuf, first_provoking_vertex);
+   }
+   batch = cmdbuf->cur_batch;
+
    uint32_t draw_layers = cmdbuf->state.gfx.render.view_mask
                              ? util_bitcount(cmdbuf->state.gfx.render.view_mask)
                              : cmdbuf->state.gfx.render.layer_count;
@@ -2678,17 +2701,6 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
       batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
    }
    batch->vertex_count += draw_vertices;
-
-   if (cmdbuf->state.gfx.vk_meta) {
-      /* vk_meta doesn't care about the provoking vertex mode, we should use
-       * the same mode that the application uses. */
-      set_provoking_vertex_mode(cmdbuf, U_TRISTATE_UNSET);
-   } else {
-      enum u_tristate first_provoking_vertex = u_tristate_make(
-         cmdbuf->vk.dynamic_graphics_state.rs.provoking_vertex ==
-         VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT);
-      set_provoking_vertex_mode(cmdbuf, first_provoking_vertex);
-   }
 
    ASSERTED const struct pan_fb_layout *fb =
       &cmdbuf->state.gfx.render.fb.layout;

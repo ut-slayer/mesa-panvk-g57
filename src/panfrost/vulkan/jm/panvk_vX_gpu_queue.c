@@ -45,6 +45,16 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
 
    /* Reset the batch if it's already been issued */
    if (batch->issued) {
+      /* Re-issuing patches the job descriptors from the CPU. Make sure the
+       * previous run of the batch is over first: some applications (vkmark,
+       * for instance) re-submit per-swapchain-image command buffers as soon
+       * as the image is acquired again, without waiting for their previous
+       * submission, and rewriting descriptors that the GPU is still reading
+       * makes the jobs fail. The queue syncobj tracks the last submission,
+       * which comes after the previous run of this batch. */
+      ret = pan_kmod_sync_wait(dev->kmod.dev, &queue->sync, 1, INT64_MAX, 0,
+                               NULL);
+      assert(!ret);
       util_dynarray_foreach(&batch->jobs, void *, job) {
          memset((*job), 0, 4 * 4);
 

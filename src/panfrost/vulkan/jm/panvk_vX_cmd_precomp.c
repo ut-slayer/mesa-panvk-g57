@@ -55,6 +55,36 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
    struct pan_ptr job = panvk_cmd_alloc_desc(cmdbuf, COMPUTE_JOB);
    assert(job.gpu);
 
+   struct pan_compute_dim dim = {.x = grid.count[0],
+                                 .y = grid.count[1],
+                                 .z = grid.count[2]};
+   uint64_t tld =
+      panvk_per_arch(cmd_dispatch_prepare_tls)(cmdbuf, shader, &dim, false);
+   assert(tld);
+
+#if PAN_ARCH >= 9
+   pan_section_pack(job.cpu, COMPUTE_JOB, PAYLOAD, cfg) {
+      cfg.workgroup_size_x = shader->cs.local_size.x;
+      cfg.workgroup_size_y = shader->cs.local_size.y;
+      cfg.workgroup_size_z = shader->cs.local_size.z;
+      cfg.workgroup_count_x = grid.count[0];
+      cfg.workgroup_count_y = grid.count[1];
+      cfg.workgroup_count_z = grid.count[2];
+
+      /* Precompiled kernels don't use a resource table. FAU entries are
+       * 64-bit. */
+      cfg.compute.resources = 0;
+      cfg.compute.shader = panvk_priv_mem_dev_addr(shader->spd);
+      cfg.compute.thread_storage = tld;
+      cfg.compute.fau = push_uniforms.gpu;
+      cfg.compute.fau_count =
+         DIV_ROUND_UP(BIFROST_PRECOMPILED_KERNEL_SYSVALS_SIZE + data_size, 8);
+
+      cfg.allow_merging_workgroups = shader->info.cs.allow_merging_workgroups;
+      cfg.task_increment = 1;
+      cfg.task_axis = MALI_TASK_AXIS_Z;
+   }
+#else
    pan_pack_work_groups_compute(
       pan_section_ptr(job.cpu, COMPUTE_JOB, INVOCATION), grid.count[0],
       grid.count[1], grid.count[2], shader->cs.local_size.x,
@@ -66,18 +96,12 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
                            util_logbase2_ceil(shader->cs.local_size.z + 1);
    }
 
-   struct pan_compute_dim dim = {.x = grid.count[0],
-                                 .y = grid.count[1],
-                                 .z = grid.count[2]};
-   uint64_t tld =
-      panvk_per_arch(cmd_dispatch_prepare_tls)(cmdbuf, shader, &dim, false);
-   assert(tld);
-
    pan_section_pack(job.cpu, COMPUTE_JOB, DRAW, cfg) {
       cfg.state = panvk_priv_mem_dev_addr(shader->rsd),
       cfg.push_uniforms = push_uniforms.gpu;
       cfg.thread_storage = tld;
    }
+#endif
 
    util_dynarray_append(&batch->jobs, job.cpu);
 

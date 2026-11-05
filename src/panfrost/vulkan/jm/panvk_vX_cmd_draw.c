@@ -2548,8 +2548,8 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
    VkResult result;
 
    /* There are only 16 bits in the descriptor for the job ID, and we need
-    * one job per layer. */
-   if (batch->vtc_jc.job_index + cmdbuf->state.gfx.render.layer_count >=
+    * one job per layer (two for indirect draws, which have a helper job). */
+   if (batch->vtc_jc.job_index + 2 * cmdbuf->state.gfx.render.layer_count >=
        UINT16_MAX) {
       panvk_per_arch(cmd_close_batch)(cmdbuf);
       batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
@@ -2706,17 +2706,151 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
    clear_dirty_after_draw(cmdbuf);
 }
 
+static uint64_t
+vs_sysval_addr(const struct panvk_cmd_buffer *cmdbuf,
+               const struct panvk_shader_variant *vs, uint32_t sysval_offset)
+{
+   /* Writes to unused sysvals go to the memory sink. */
+   return cmdbuf->state.gfx.vs.push_uniforms +
+          shader_remapped_sysval_offset(vs, sysval_offset);
+}
+
 static void
 panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
                         struct panvk_draw_data *draw)
 {
-   /* TODO: needs a v9 libpan helper patching the MALLOC_VERTEX_JOB (index
-    * count, instance count, base vertex and the vertex sysvals). */
-   static bool warned = false;
-   if (!warned) {
-      mesa_logw("panvk: indirect draws are not implemented on v9 yet");
-      warned = true;
+   const struct panvk_shader_variant *vs =
+      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+   const struct vk_dynamic_graphics_state *dyns =
+      &cmdbuf->vk.dynamic_graphics_state;
+   VkResult result;
+
+   /* If there's no vertex shader, we can skip the draw. */
+   if (!panvk_priv_mem_check_alloc(vs->spds.pos_triangles))
+      return;
+
+   assert(vs->info.vs.idvs);
+   assert(draw->info.indirect.buffer_dev_addr != 0);
+
+   /* See panvk_cmd_draw(). */
+   if (dyns->rs.rasterizer_discard_enable)
+      return;
+
+   cmdbuf->state.gfx.fs.required =
+      fs_required(&cmdbuf->state.gfx, &cmdbuf->vk.dynamic_graphics_state);
+
+   /* The draw parameters are only known on the GPU. Emit the job and the
+    * state with placeholders (no base vertex/instance, one vertex, one
+    * instance), and let the indirect helper patch them. The vertex
+    * attribute descriptors and the push uniforms are patched too, so make
+    * sure fresh ones are allocated for this draw. */
+   draw->info.vertex.base = 0;
+   draw->info.vertex.count = 1;
+   draw->info.instance.base = 0;
+   draw->info.instance.count = 1;
+   cmdbuf->state.gfx.vi.base_instance = 0;
+   gfx_state_set_dirty(cmdbuf, BASE_INSTANCE);
+
+   result = prepare_draw(cmdbuf, draw);
+   if (result != VK_SUCCESS)
+      return;
+
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+   const struct vk_vertex_input_state *vi = dyns->vi;
+
+   /* Per-instance attributes whose offset depends on the base instance. */
+   const uint32_t attribs_mask =
+      cmdbuf->state.gfx.vi.attribs_changing_on_base_instance;
+   uint64_t attrib_strides = 0;
+   if (attribs_mask) {
+      struct pan_ptr strides = panvk_cmd_alloc_dev_mem(
+         cmdbuf, desc, MAX_VS_ATTRIBS * sizeof(uint32_t), sizeof(uint32_t));
+      if (!strides.gpu)
+         return;
+
+      uint32_t *s = strides.cpu;
+      u_foreach_bit(i, attribs_mask)
+         s[i] = dyns->vi_binding_strides[vi->attributes[i].binding];
+      attrib_strides = strides.gpu;
    }
+
+   STATIC_ASSERT(pan_size(ATTRIBUTE) == PANVK_DESCRIPTOR_SIZE);
+   /* The vertex attributes are the first entries of the VS driver set. */
+   const uint64_t attribs = cmdbuf->state.gfx.vs.desc.driver_set.dev_addr;
+
+   uint64_t first_vertex_sysval = 0x8ull << 60;
+   uint64_t first_instance_sysval = 0x8ull << 60;
+   if (shader_uses_sysval(vs, graphics, vs.first_vertex))
+      first_vertex_sysval =
+         vs_sysval_addr(cmdbuf, vs, sysval_offset(graphics, vs.first_vertex));
+   if (shader_uses_sysval(vs, graphics, vs.base_instance))
+      first_instance_sysval =
+         vs_sysval_addr(cmdbuf, vs, sysval_offset(graphics, vs.base_instance));
+
+   struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+   uint32_t view_mask = cmdbuf->state.gfx.render.view_mask;
+   assert(view_mask == 0 || util_bitcount(view_mask) <= batch->fb.layer_count);
+   uint32_t enabled_layer_count = view_mask
+                                     ? util_bitcount(view_mask)
+                                     : cmdbuf->state.gfx.render.layer_count;
+
+   for (uint32_t i = 0; i < enabled_layer_count; i++) {
+      const uint32_t layer = (view_mask != 0) ? u_bit_scan(&view_mask) : i;
+
+      draw->info.layer_id = layer;
+      result = panvk_draw_prepare_tiler_context(cmdbuf, draw);
+      if (result != VK_SUCCESS)
+         return;
+
+      result = panvk_draw_prepare_malloc_vertex_job(cmdbuf, draw);
+      if (result != VK_SUCCESS)
+         return;
+
+      /* The attribute descriptors are shared by all layers: only patch
+       * them once. */
+      const uint32_t layer_attribs_mask = i == 0 ? attribs_mask : 0;
+
+      if (draw->info.index.index_size) {
+         const struct panlib_draw_indexed_indirect_helper_args args = {
+            .cmd = draw->info.indirect.buffer_dev_addr,
+            .job = draw->job.gpu,
+            .index_buffer_ptr = draw->info.index.buffer_dev_addr,
+            .attribs = attribs,
+            .attrib_strides = attrib_strides,
+            .first_vertex_sysval = first_vertex_sysval,
+            .first_instance_sysval = first_instance_sysval,
+            .attribs_mask = layer_attribs_mask,
+            .index_size = draw->info.index.index_size,
+         };
+         panlib_draw_indexed_indirect_helper_struct(
+            &precomp_ctx, panlib_1d(1), PANLIB_BARRIER_JM_SUPPRESS_PREFETCH,
+            args);
+      } else {
+         const struct panlib_draw_indirect_helper_args args = {
+            .cmd = draw->info.indirect.buffer_dev_addr,
+            .job = draw->job.gpu,
+            .attribs = attribs,
+            .attrib_strides = attrib_strides,
+            .first_vertex_sysval = first_vertex_sysval,
+            .first_instance_sysval = first_instance_sysval,
+            .attribs_mask = layer_attribs_mask,
+         };
+         panlib_draw_indirect_helper_struct(
+            &precomp_ctx, panlib_1d(1), PANLIB_BARRIER_JM_SUPPRESS_PREFETCH,
+            args);
+      }
+
+      /* The draw job depends on the helper job that patches it. */
+      uint32_t helper_job = batch->vtc_jc.job_index;
+      pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_MALLOC_VERTEX, false, false,
+                     0, helper_job, &draw->job, false);
+   }
+
+   /* The attribute descriptors were patched with the indirect base
+    * instance: make sure the next draw doesn't reuse them. */
+   cmdbuf->state.gfx.vi.base_instance = UINT32_MAX;
+
+   clear_dirty_after_draw(cmdbuf);
 }
 
 #endif /* PAN_ARCH < 9 */

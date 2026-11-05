@@ -2477,9 +2477,17 @@ panvk_emit_primitive(struct panvk_cmd_buffer *cmdbuf,
    bool writes_prim_id = vs->info.outputs_written & VARYING_BIT_PRIMITIVE_ID;
    bool fs_reads_prim_id = fs ? fs->info.fs.reads_primitive_id : false;
 
+   /* v9 has no explicit position FIFO format: the extended FIFO (position
+    * plus point size/layer slot) is selected through the point size array
+    * format. The position shader writes gl_Layer (and the other extended
+    * outputs) there even when not drawing points, so it must be enabled
+    * whenever the shader needs it, otherwise each vertex overwrites the
+    * position of the next one. */
+   bool extended_fifo = writes_point_size || vs->info.vs.needs_extended_fifo;
+
    pan_pack(prim, PRIMITIVE, cfg) {
       cfg.draw_mode = translate_prim(draw->info.prim);
-      if (writes_point_size)
+      if (extended_fifo)
          cfg.point_size_array_format = MALI_POINT_SIZE_ARRAY_FORMAT_FP16;
       cfg.primitive_index_enable = fs_reads_prim_id;
       cfg.primitive_index_override = writes_prim_id && fs_reads_prim_id;

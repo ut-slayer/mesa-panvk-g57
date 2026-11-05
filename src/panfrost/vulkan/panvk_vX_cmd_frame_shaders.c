@@ -647,9 +647,10 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf,
 
    fill_textures(cmdbuf, iviews, key, descs.cpu + PANVK_DESCRIPTOR_SIZE);
 
-   uint32_t rt_written =
+   /* v9 has no DCD flags 2, so these are only used on v10+. */
+   UNUSED uint32_t rt_written =
       (locations_written >> FRAG_RESULT_DATA0) & BITFIELD_MASK(PAN_MAX_RTS);
-   uint32_t rt_read =
+   UNUSED uint32_t rt_read =
       (locations_read >> FRAG_RESULT_DATA0) & BITFIELD_MASK(PAN_MAX_RTS);
 
    if (preload_color)
@@ -714,6 +715,20 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf,
    };
    memcpy(faus.cpu, &sysvals, sizeof(sysvals));
 
+#if PAN_ARCH < 10
+   /* On JM, the thread storage descriptor lives in the batch. If we got a
+    * preload without any draw, it's not allocated yet: allocate a dummy one
+    * (no TLS, no WLS), like the Bifrost path does. */
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+   if (!batch->tls.cpu) {
+      panvk_per_arch(cmd_alloc_tls_desc)(cmdbuf, true);
+      GENX(pan_emit_tls)(&batch->tlsinfo, batch->tls.cpu);
+   }
+   const uint64_t tsd = batch->tls.gpu;
+#else
+   const uint64_t tsd = cmdbuf->state.gfx.tsd;
+#endif
+
    pan_pack(&(*dcds)[dcd_idx], DRAW, cfg) {
       if (preload_z || preload_s) {
          /* ZS_EMIT requires late update/kill */
@@ -752,17 +767,19 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf,
       cfg.fragment_shader = panvk_priv_mem_dev_addr(shader->spd);
       cfg.fragment_fau.pointer = faus.gpu;
       cfg.fragment_fau.count = sizeof(struct panvk_fb_sysvals) / FAU_WORD_SIZE;
-      cfg.thread_storage = cmdbuf->state.gfx.tsd;
+      cfg.thread_storage = tsd;
 #else
       cfg.maximum_z = 1.0;
       cfg.shader.resources = res_table.gpu | res_table_size;
       cfg.shader.shader = panvk_priv_mem_dev_addr(shader->spd);
-      cfg.shader.thread_storage = cmdbuf->state.gfx.tsd;
+      cfg.shader.thread_storage = tsd;
       cfg.shader.fau_count = sizeof(struct panvk_fb_sysvals) / FAU_WORD_SIZE;
       cfg.shader.fau = faus.gpu;
 #endif
+#if PAN_ARCH >= 10
       cfg.flags_2.write_mask = rt_written;
       cfg.flags_2.read_mask = rt_read;
+#endif
 #if PAN_ARCH >= 11
       cfg.flags_2.no_shader_depth_read =
          !(locations_read & BITFIELD_BIT(FRAG_RESULT_DEPTH));

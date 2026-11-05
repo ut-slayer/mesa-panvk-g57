@@ -181,7 +181,12 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 
          fbd_info.layer = layer_id;
          fbd_info.frame_shaders = fs;
+#if PAN_ARCH < 9
+         /* On Bifrost, frame shaders get the layer through a per-layer DCD.
+          * On v9, they read it from the FBD frame argument, so the DCDs are
+          * shared by all layers. */
          fbd_info.frame_shaders.dcd_pointer += layer_id * 3 * pan_size(DRAW);
+#endif
 
          const struct pan_fb_descs fb_descs = {
             .fbd = fbd.cpu,

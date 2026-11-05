@@ -231,6 +231,21 @@ struct panvk_cmd_graphics_state {
    uint64_t vpd;
 #endif
 
+#if PAN_ARCH == 9
+   /* Valhall JM: descriptors and DCD flags referenced by every draw job,
+    * only re-emitted when the state they depend on changes. Everything is
+    * zero (not valid) after a command buffer reset. */
+   struct {
+      uint64_t zsd;
+      bool blend_valid;
+      uint64_t blend;
+      uint32_t blend_count;
+      bool flags_valid;
+      struct mali_dcd_flags_0_packed flags_0;
+      struct mali_dcd_flags_1_packed flags_1;
+   } dcd;
+#endif
+
 #if PAN_ARCH >= 10
    uint64_t tsd;
 #endif

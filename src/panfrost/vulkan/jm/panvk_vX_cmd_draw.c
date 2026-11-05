@@ -2091,9 +2091,37 @@ prepare_descs(struct panvk_cmd_buffer *cmdbuf)
    return prepare_fs_desc(cmdbuf);
 }
 
+static bool
+zsd_dirty(struct panvk_cmd_buffer *cmdbuf)
+{
+   return !cmdbuf->state.gfx.dcd.zsd ||
+          dyn_gfx_state_dirty(cmdbuf, DS_DEPTH_TEST_ENABLE) ||
+          dyn_gfx_state_dirty(cmdbuf, DS_DEPTH_WRITE_ENABLE) ||
+          dyn_gfx_state_dirty(cmdbuf, DS_DEPTH_COMPARE_OP) ||
+          dyn_gfx_state_dirty(cmdbuf, DS_STENCIL_TEST_ENABLE) ||
+          dyn_gfx_state_dirty(cmdbuf, DS_STENCIL_OP) ||
+          dyn_gfx_state_dirty(cmdbuf, DS_STENCIL_COMPARE_MASK) ||
+          dyn_gfx_state_dirty(cmdbuf, DS_STENCIL_WRITE_MASK) ||
+          dyn_gfx_state_dirty(cmdbuf, DS_STENCIL_REFERENCE) ||
+          dyn_gfx_state_dirty(cmdbuf, RS_DEPTH_CLAMP_ENABLE) ||
+          dyn_gfx_state_dirty(cmdbuf, RS_DEPTH_CLIP_ENABLE) ||
+          dyn_gfx_state_dirty(cmdbuf, RS_DEPTH_BIAS_ENABLE) ||
+          dyn_gfx_state_dirty(cmdbuf, RS_DEPTH_BIAS_FACTORS) ||
+          dyn_gfx_state_dirty(cmdbuf, MS_ALPHA_TO_COVERAGE_ENABLE) ||
+          dyn_gfx_state_dirty(cmdbuf, INPUT_ATTACHMENT_MAP) ||
+          fs_user_dirty(cmdbuf) || gfx_state_dirty(cmdbuf, OQ) ||
+          /* has_{depth,stencil}_att() depend on the render pass */
+          gfx_state_dirty(cmdbuf, RENDER_STATE);
+}
+
 static VkResult
 prepare_zsd(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
 {
+   if (!zsd_dirty(cmdbuf)) {
+      draw->zsd = cmdbuf->state.gfx.dcd.zsd;
+      return VK_SUCCESS;
+   }
+
    const struct vk_dynamic_graphics_state *dyns =
       &cmdbuf->vk.dynamic_graphics_state;
    const struct vk_rasterization_state *rs = &dyns->rs;
@@ -2149,8 +2177,26 @@ prepare_zsd(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
       cfg.depth_bias_clamp = rs->depth_bias.clamp;
    }
 
+   cmdbuf->state.gfx.dcd.zsd = zsd.gpu;
    draw->zsd = zsd.gpu;
    return VK_SUCCESS;
+}
+
+static bool
+blend_dirty(struct panvk_cmd_buffer *cmdbuf)
+{
+   return !cmdbuf->state.gfx.dcd.blend_valid ||
+          dyn_gfx_state_dirty(cmdbuf, MS_ALPHA_TO_ONE_ENABLE) ||
+          dyn_gfx_state_dirty(cmdbuf, CB_LOGIC_OP_ENABLE) ||
+          dyn_gfx_state_dirty(cmdbuf, CB_LOGIC_OP) ||
+          dyn_gfx_state_dirty(cmdbuf, CB_ATTACHMENT_COUNT) ||
+          dyn_gfx_state_dirty(cmdbuf, CB_COLOR_WRITE_ENABLES) ||
+          dyn_gfx_state_dirty(cmdbuf, CB_BLEND_ENABLES) ||
+          dyn_gfx_state_dirty(cmdbuf, CB_BLEND_EQUATIONS) ||
+          dyn_gfx_state_dirty(cmdbuf, CB_WRITE_MASKS) ||
+          dyn_gfx_state_dirty(cmdbuf, CB_BLEND_CONSTANTS) ||
+          dyn_gfx_state_dirty(cmdbuf, COLOR_ATTACHMENT_MAP) ||
+          fs_user_dirty(cmdbuf) || gfx_state_dirty(cmdbuf, RENDER_STATE);
 }
 
 static VkResult
@@ -2158,6 +2204,14 @@ prepare_blend(struct panvk_cmd_buffer *cmdbuf,
               const struct panvk_shader_variant *fs,
               struct panvk_draw_data *draw)
 {
+   struct panvk_cmd_graphics_state *gfx = &cmdbuf->state.gfx;
+
+   if (!blend_dirty(cmdbuf)) {
+      draw->blend = gfx->dcd.blend;
+      draw->blend_count = gfx->dcd.blend_count;
+      return VK_SUCCESS;
+   }
+
    uint32_t bd_count = cmdbuf->state.gfx.render.fb.layout.rt_count;
    struct pan_ptr ptr = panvk_cmd_alloc_desc_array(cmdbuf, bd_count, BLEND);
    struct mali_blend_packed *bds = ptr.cpu;
@@ -2178,6 +2232,9 @@ prepare_blend(struct panvk_cmd_buffer *cmdbuf,
       }
    }
 
+   gfx->dcd.blend_valid = true;
+   gfx->dcd.blend = ptr.gpu;
+   gfx->dcd.blend_count = bd_count;
    draw->blend = ptr.gpu;
    draw->blend_count = bd_count;
    return VK_SUCCESS;
@@ -2185,11 +2242,48 @@ prepare_blend(struct panvk_cmd_buffer *cmdbuf,
 
 /* Same logic as build_dcd_flags() in the CSF backend, minus DCD flags 2,
  * which doesn't exist on v9. */
+static bool
+dcd_flags_dirty(struct panvk_cmd_buffer *cmdbuf)
+{
+   /* Union of the CSF DCD0/DCD1 dirty conditions. */
+   return !cmdbuf->state.gfx.dcd.flags_valid ||
+          dyn_gfx_state_dirty(cmdbuf, RS_RASTERIZER_DISCARD_ENABLE) ||
+          dyn_gfx_state_dirty(cmdbuf, RS_CULL_MODE) ||
+          dyn_gfx_state_dirty(cmdbuf, RS_LINE_MODE) ||
+          dyn_gfx_state_dirty(cmdbuf, RS_FRONT_FACE) ||
+          dyn_gfx_state_dirty(cmdbuf, MS_RASTERIZATION_SAMPLES) ||
+          dyn_gfx_state_dirty(cmdbuf, MS_SAMPLE_MASK) ||
+          dyn_gfx_state_dirty(cmdbuf, MS_ALPHA_TO_COVERAGE_ENABLE) ||
+          dyn_gfx_state_dirty(cmdbuf, MS_ALPHA_TO_ONE_ENABLE) ||
+          dyn_gfx_state_dirty(cmdbuf, DS_DEPTH_TEST_ENABLE) ||
+          dyn_gfx_state_dirty(cmdbuf, DS_DEPTH_WRITE_ENABLE) ||
+          dyn_gfx_state_dirty(cmdbuf, DS_DEPTH_COMPARE_OP) ||
+          dyn_gfx_state_dirty(cmdbuf, DS_STENCIL_TEST_ENABLE) ||
+          dyn_gfx_state_dirty(cmdbuf, DS_STENCIL_OP) ||
+          dyn_gfx_state_dirty(cmdbuf, DS_STENCIL_WRITE_MASK) ||
+          dyn_gfx_state_dirty(cmdbuf, CB_BLEND_ENABLES) ||
+          dyn_gfx_state_dirty(cmdbuf, CB_BLEND_EQUATIONS) ||
+          dyn_gfx_state_dirty(cmdbuf, CB_WRITE_MASKS) ||
+          dyn_gfx_state_dirty(cmdbuf, IA_PRIMITIVE_TOPOLOGY) ||
+          dyn_gfx_state_dirty(cmdbuf, INPUT_ATTACHMENT_MAP) ||
+          dyn_gfx_state_dirty(cmdbuf, COLOR_ATTACHMENT_MAP) ||
+          fs_user_dirty(cmdbuf) || gfx_state_dirty(cmdbuf, RENDER_STATE) ||
+          gfx_state_dirty(cmdbuf, OQ);
+}
+
 static void
 prepare_dcd_flags(struct panvk_cmd_buffer *cmdbuf,
                   const struct panvk_shader_variant *fs,
                   struct panvk_draw_data *draw)
 {
+   struct panvk_cmd_graphics_state *gfx = &cmdbuf->state.gfx;
+
+   if (!dcd_flags_dirty(cmdbuf)) {
+      draw->dcd_flags_0 = gfx->dcd.flags_0;
+      draw->dcd_flags_1 = gfx->dcd.flags_1;
+      return;
+   }
+
    const struct vk_dynamic_graphics_state *dyns =
       &cmdbuf->vk.dynamic_graphics_state;
    const struct vk_rasterization_state *rs = &dyns->rs;
@@ -2304,6 +2398,10 @@ prepare_dcd_flags(struct panvk_cmd_buffer *cmdbuf,
       cfg.sample_mask = dyns->ms.sample_mask;
       cfg.render_target_mask = rt_written;
    }
+
+   gfx->dcd.flags_valid = true;
+   gfx->dcd.flags_0 = draw->dcd_flags_0;
+   gfx->dcd.flags_1 = draw->dcd_flags_1;
 }
 
 static void
@@ -2626,22 +2724,28 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
 
    prepare_viewport(cmdbuf, draw);
 
-   struct pan_ptr vs_push_uniforms;
-   result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
-      cmdbuf, vs, &vs_push_uniforms, 1);
-   if (result != VK_SUCCESS)
-      return result;
-   cmdbuf->state.gfx.vs.push_uniforms = vs_push_uniforms.gpu;
-
-   if (fs) {
-      struct pan_ptr fs_push_uniforms;
+   /* Push uniforms (FAU) only change when the push constants, the shaders or
+    * the sysvals they use change: cmd_prepare_draw_sysvals() flags them. */
+   if (gfx_state_dirty(cmdbuf, VS_PUSH_UNIFORMS)) {
+      struct pan_ptr vs_push_uniforms;
       result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
-         cmdbuf, fs, &fs_push_uniforms, 1);
+         cmdbuf, vs, &vs_push_uniforms, 1);
       if (result != VK_SUCCESS)
          return result;
-      cmdbuf->state.gfx.fs.push_uniforms = fs_push_uniforms.gpu;
-   } else {
-      cmdbuf->state.gfx.fs.push_uniforms = 0;
+      cmdbuf->state.gfx.vs.push_uniforms = vs_push_uniforms.gpu;
+   }
+
+   if (fs_user_dirty(cmdbuf) || gfx_state_dirty(cmdbuf, FS_PUSH_UNIFORMS)) {
+      if (fs) {
+         struct pan_ptr fs_push_uniforms;
+         result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
+            cmdbuf, fs, &fs_push_uniforms, 1);
+         if (result != VK_SUCCESS)
+            return result;
+         cmdbuf->state.gfx.fs.push_uniforms = fs_push_uniforms.gpu;
+      } else {
+         cmdbuf->state.gfx.fs.push_uniforms = 0;
+      }
    }
 
    return VK_SUCCESS;
@@ -2750,6 +2854,7 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
    draw->info.instance.count = 1;
    cmdbuf->state.gfx.vi.base_instance = 0;
    gfx_state_set_dirty(cmdbuf, BASE_INSTANCE);
+   gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
 
    result = prepare_draw(cmdbuf, draw);
    if (result != VK_SUCCESS)
@@ -2851,6 +2956,9 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
    cmdbuf->state.gfx.vi.base_instance = UINT32_MAX;
 
    clear_dirty_after_draw(cmdbuf);
+
+   /* Same for the VS push uniforms, whose sysvals were patched. */
+   gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
 }
 
 #endif /* PAN_ARCH < 9 */

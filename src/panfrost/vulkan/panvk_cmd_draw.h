@@ -94,7 +94,7 @@ struct panvk_rendering_state {
       /* nr_samples to be used before framebuffer / tiler descriptor are emitted */
       uint32_t nr_samples;
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10 /* JM */
       uint32_t bo_count;
       struct pan_kmod_bo *bos[(MAX_RTS * PANVK_MAX_PLANES) + 2];
       bool needs_load;
@@ -444,7 +444,7 @@ struct panvk_draw_info {
 
    enum mesa_prim prim;
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10 /* JM: one draw per layer */
    uint32_t layer_id;
 #endif
 };

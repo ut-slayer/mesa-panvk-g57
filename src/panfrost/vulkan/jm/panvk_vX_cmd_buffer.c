@@ -298,6 +298,12 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
       cfg.fb_height = fb->height_px;
       cfg.heap = batch->tiler.heap_desc.gpu;
       cfg.sample_pattern = pan_sample_pattern(fb->sample_count);
+#if PAN_ARCH >= 9
+      /* On Valhall, the provoking vertex is selected in the tiler context
+       * instead of the primitive descriptor. */
+      cfg.first_provoking_vertex =
+         cmdbuf->state.gfx.render.first_provoking_vertex != U_TRISTATE_NO;
+#endif
    }
 
    memcpy(batch->tiler.heap_desc.cpu, &batch->tiler.heap_templ,
@@ -314,10 +320,16 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
    }
 
 out_set_layer_ctx:
-   if (PAN_ARCH >= 9)
-      batch->tiler.ctx.valhall.desc = tiler_desc;
-   else
-      batch->tiler.ctx.bifrost.desc = tiler_desc;
+#if PAN_ARCH >= 9
+   batch->tiler.ctx.valhall.desc = tiler_desc;
+   /* We use one single-layer tiler context per layer, so the primitive list
+    * to select in that context is always the first one. pan_emit_fb_desc()
+    * computes internal_layer_index as layer - layer_offset, so make it 0.
+    * The descriptor itself keeps layer_offset=0. */
+   batch->tiler.ctx.valhall.layer_offset = layer_idx;
+#else
+   batch->tiler.ctx.bifrost.desc = tiler_desc;
+#endif
 
    return VK_SUCCESS;
 }

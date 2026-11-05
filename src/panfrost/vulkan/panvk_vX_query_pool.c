@@ -70,6 +70,14 @@ panvk_per_arch(CreateQueryPool)(VkDevice _device,
       reports_per_query = 1;
       break;
    }
+#else
+   case VK_QUERY_TYPE_TIMESTAMP: {
+      /* The JM backend reports timestampValidBits = 0, so timestamps are
+       * never written, but creating a timestamp pool is still valid and some
+       * applications (PPSSPP, for instance) always do it. */
+      reports_per_query = 1;
+      break;
+   }
 #endif
    default:
       UNREACHABLE("Unsupported query type");
@@ -281,6 +289,13 @@ panvk_per_arch(GetQueryPoolResults)(VkDevice _device, VkQueryPool queryPool,
          case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT: {
             if (write_results)
                cpu_write_query_result(dst, 0, flags, src[0].value);
+            break;
+         }
+#else
+         case VK_QUERY_TYPE_TIMESTAMP: {
+            /* Never written on JM (timestampValidBits = 0). */
+            if (write_results)
+               cpu_write_query_result(dst, 0, flags, 0);
             break;
          }
 #endif

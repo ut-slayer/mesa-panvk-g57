@@ -66,6 +66,7 @@
 
 PER_ARCH_FUNCS(6);
 PER_ARCH_FUNCS(7);
+PER_ARCH_FUNCS(9);
 PER_ARCH_FUNCS(10);
 PER_ARCH_FUNCS(11);
 PER_ARCH_FUNCS(12);
@@ -454,6 +455,7 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    switch (arch) {
    case 6:
    case 7:
+   case 9:
    case 11:
    case 14:
       if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {

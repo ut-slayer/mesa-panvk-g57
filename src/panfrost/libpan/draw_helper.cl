@@ -631,4 +631,124 @@ panlib_draw_index_minmax_search_helper(global uint8_t *index_buffer_ptr,
    atomic_fetch_min(min_ptr, local_min);
    atomic_fetch_max(max_ptr, local_max);
 }
+#else /* PAN_ARCH == 9 */
+
+/* v9 (Valhall + JM) indirect draws: the driver emits a MALLOC_VERTEX_JOB with
+ * placeholder counts, and these helpers patch it with the parameters read
+ * from the indirect buffer, along with the vertex shader sysvals and the
+ * per-instance attribute offsets that depend on the base instance.
+ */
+
+static void
+panlib_patch_malloc_vertex_job(global uint8_t *job, uint32_t count,
+                               uint32_t instance_count, int32_t base_vertex,
+                               uint64_t indices)
+{
+   global struct mali_job_header_packed *header =
+      (global struct mali_job_header_packed *)job;
+
+   /* Nothing to draw: turn the job into a NULL job, which keeps the job
+    * chain dependencies intact. */
+   if (count == 0 || instance_count == 0) {
+      pan_unpack(header, JOB_HEADER, unpacked_header);
+      pan_pack(header, JOB_HEADER, cfg) {
+         memcpy(&cfg, &unpacked_header, sizeof(cfg));
+         cfg.type = MALI_JOB_TYPE_NULL;
+      }
+      return;
+   }
+
+   global struct mali_primitive_packed *prim =
+      (global struct mali_primitive_packed *)(job + pan_section_offset(
+                                                       MALLOC_VERTEX_JOB,
+                                                       PRIMITIVE));
+   pan_unpack(prim, PRIMITIVE, unpacked_prim);
+   pan_pack(prim, PRIMITIVE, cfg) {
+      memcpy(&cfg, &unpacked_prim, sizeof(cfg));
+      cfg.index_count = count;
+      cfg.base_vertex_offset = base_vertex;
+   }
+
+   global struct mali_count_packed *instances =
+      (global struct mali_count_packed *)(job + pan_section_offset(
+                                                   MALLOC_VERTEX_JOB,
+                                                   INSTANCE_COUNT));
+   pan_pack(instances, COUNT, cfg) {
+      cfg.count = instance_count;
+   }
+
+   if (indices) {
+      global struct mali_indices_packed *idx =
+         (global struct mali_indices_packed *)(job + pan_section_offset(
+                                                        MALLOC_VERTEX_JOB,
+                                                        INDICES));
+      pan_pack(idx, INDICES, cfg) {
+         cfg.address = indices;
+      }
+   }
+}
+
+static void
+panlib_patch_vs_attribs(global struct mali_attribute_packed *attribs,
+                        global uint32_t *strides, uint32_t mask,
+                        uint32_t first_instance)
+{
+   /* Per-instance attributes start at base_instance * stride. The offset is
+    * word 2 of the attribute descriptor. It's patched directly because the
+    * descriptor has overlapping fields that wouldn't survive an
+    * unpack/pack round trip. */
+   for (uint32_t i = 0; i < 32; i++) {
+      if (!(mask & (1u << i)))
+         continue;
+
+      global int32_t *words = (global int32_t *)&attribs[i];
+      words[2] += (int32_t)(first_instance * strides[i]);
+   }
+}
+
+/* Argument ordering choosen to avoid any padding */
+
+KERNEL(1)
+panlib_draw_indirect_helper(global VkDrawIndirectCommand *cmd,
+                            global uint8_t *job,
+                            global struct mali_attribute_packed *attribs,
+                            global uint32_t *attrib_strides,
+                            global uint32_t *first_vertex_sysval,
+                            global uint32_t *first_instance_sysval,
+                            uint32_t attribs_mask)
+{
+   panlib_patch_malloc_vertex_job(job, cmd->vertexCount, cmd->instanceCount,
+                                  cmd->firstVertex, 0);
+
+   if (attribs_mask)
+      panlib_patch_vs_attribs(attribs, attrib_strides, attribs_mask,
+                              cmd->firstInstance);
+
+   *first_vertex_sysval = cmd->firstVertex;
+   *first_instance_sysval = cmd->firstInstance;
+}
+
+KERNEL(1)
+panlib_draw_indexed_indirect_helper(global VkDrawIndexedIndirectCommand *cmd,
+                                    global uint8_t *job,
+                                    global uint8_t *index_buffer_ptr,
+                                    global struct mali_attribute_packed *attribs,
+                                    global uint32_t *attrib_strides,
+                                    global uint32_t *first_vertex_sysval,
+                                    global uint32_t *first_instance_sysval,
+                                    uint32_t attribs_mask, uint32_t index_size)
+{
+   uint64_t indices = (uint64_t)(uintptr_t)index_buffer_ptr +
+                      (uint64_t)cmd->firstIndex * index_size;
+
+   panlib_patch_malloc_vertex_job(job, cmd->indexCount, cmd->instanceCount,
+                                  cmd->vertexOffset, indices);
+
+   if (attribs_mask)
+      panlib_patch_vs_attribs(attribs, attrib_strides, attribs_mask,
+                              cmd->firstInstance);
+
+   *first_vertex_sysval = cmd->vertexOffset;
+   *first_instance_sysval = cmd->firstInstance;
+}
 #endif

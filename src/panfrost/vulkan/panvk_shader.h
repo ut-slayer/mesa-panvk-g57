@@ -165,12 +165,15 @@ struct panvk_graphics_sysvals {
 
    struct panvk_input_attachment_info iam[INPUT_ATTACHMENT_MAP_SIZE];
 
-#if PAN_ARCH < 9
-   /* gl_Layer on Bifrost is a bit of hack. We have to issue one draw per
-    * layer, and filter primitives at the VS level.
+#if PAN_ARCH < 10
+   /* gl_Layer with the JM backend is a bit of hack. We have to issue one draw
+    * per layer, and filter primitives at the VS level. This is also how
+    * multiview is implemented (one draw per view).
     */
    int32_t layer_id;
+#endif
 
+#if PAN_ARCH < 9
    struct {
       aligned_u64 sets[PANVK_DESC_TABLE_GFX_COUNT];
    } desc;

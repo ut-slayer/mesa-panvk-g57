@@ -2759,6 +2759,33 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
    return VK_SUCCESS;
 }
 
+/* Like on Bifrost, layered rendering and multiview issue one job per layer:
+ * the vertex shader discards primitives written to other layers (and gets
+ * the view index) through the layer_id sysval, so the VS push uniforms need
+ * to be re-emitted per layer when the shader uses it. */
+static VkResult
+prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
+                   const struct panvk_shader_variant *vs,
+                   struct panvk_draw_data *draw, uint32_t layer)
+{
+   draw->info.layer_id = layer;
+
+   if (cmdbuf->state.gfx.sysvals.layer_id != (int32_t)layer) {
+      cmdbuf->state.gfx.sysvals.layer_id = layer;
+
+      if (shader_uses_sysval(vs, graphics, layer_id)) {
+         struct pan_ptr push_uniforms;
+         VkResult result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
+            cmdbuf, vs, &push_uniforms, 1);
+         if (result != VK_SUCCESS)
+            return result;
+         cmdbuf->state.gfx.vs.push_uniforms = push_uniforms.gpu;
+      }
+   }
+
+   return panvk_draw_prepare_tiler_context(cmdbuf, draw);
+}
+
 static void
 panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
 {
@@ -2795,15 +2822,12 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
                                      ? util_bitcount(view_mask)
                                      : cmdbuf->state.gfx.render.layer_count;
 
-   /* Like on Bifrost, we issue one job per layer, each with its own tiler
-    * context.
-    * TODO: gl_Layer writes and multiview need the Bifrost layer filtering
-    * (layer_id sysval) or real layered rendering on v9. */
+   /* Like on Bifrost, we issue one job per layer (or view), each with its
+    * own tiler context. */
    for (uint32_t i = 0; i < enabled_layer_count; i++) {
       const uint32_t layer = (view_mask != 0) ? u_bit_scan(&view_mask) : i;
 
-      draw->info.layer_id = layer;
-      result = panvk_draw_prepare_tiler_context(cmdbuf, draw);
+      result = prepare_draw_layer(cmdbuf, vs, draw, layer);
       if (result != VK_SUCCESS)
          return;
 
@@ -2891,15 +2915,6 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
    /* The vertex attributes are the first entries of the VS driver set. */
    const uint64_t attribs = cmdbuf->state.gfx.vs.desc.driver_set.dev_addr;
 
-   uint64_t first_vertex_sysval = 0x8ull << 60;
-   uint64_t first_instance_sysval = 0x8ull << 60;
-   if (shader_uses_sysval(vs, graphics, vs.first_vertex))
-      first_vertex_sysval =
-         vs_sysval_addr(cmdbuf, vs, sysval_offset(graphics, vs.first_vertex));
-   if (shader_uses_sysval(vs, graphics, vs.base_instance))
-      first_instance_sysval =
-         vs_sysval_addr(cmdbuf, vs, sysval_offset(graphics, vs.base_instance));
-
    struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
    uint32_t view_mask = cmdbuf->state.gfx.render.view_mask;
    assert(view_mask == 0 || util_bitcount(view_mask) <= batch->fb.layer_count);
@@ -2910,14 +2925,23 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
    for (uint32_t i = 0; i < enabled_layer_count; i++) {
       const uint32_t layer = (view_mask != 0) ? u_bit_scan(&view_mask) : i;
 
-      draw->info.layer_id = layer;
-      result = panvk_draw_prepare_tiler_context(cmdbuf, draw);
+      result = prepare_draw_layer(cmdbuf, vs, draw, layer);
       if (result != VK_SUCCESS)
          return;
 
       result = panvk_draw_prepare_malloc_vertex_job(cmdbuf, draw);
       if (result != VK_SUCCESS)
          return;
+
+      /* The VS push uniforms may be different for each layer. */
+      uint64_t first_vertex_sysval = 0x8ull << 60;
+      uint64_t first_instance_sysval = 0x8ull << 60;
+      if (shader_uses_sysval(vs, graphics, vs.first_vertex))
+         first_vertex_sysval = vs_sysval_addr(
+            cmdbuf, vs, sysval_offset(graphics, vs.first_vertex));
+      if (shader_uses_sysval(vs, graphics, vs.base_instance))
+         first_instance_sysval = vs_sysval_addr(
+            cmdbuf, vs, sysval_offset(graphics, vs.base_instance));
 
       /* The attribute descriptors are shared by all layers: only patch
        * them once. */

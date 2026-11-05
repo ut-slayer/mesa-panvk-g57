@@ -119,6 +119,13 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
          val = nir_imm_zero(b, 1, 32);
          break;
       } else if (b->shader->info.stage == MESA_SHADER_VERTEX) {
+#if PAN_ARCH < 10
+         /* With the JM backend, we issue one draw per view and pass the view
+          * index through the layer_id sysval, like on Bifrost.
+          */
+         val = load_sysval(b, graphics, bit_size, layer_id);
+         break;
+#else
          /* On v14+ we have real multiview and view_index comes from a preload
           * in the vertex stage.  On earlier generations, view_index in vertex
           * shaders gets lowered away by nir_lower_multiview() so we should
@@ -126,6 +133,7 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
           */
          assert(PAN_ARCH >= 14);
          return false;
+#endif
       }
 
       /* For fragment shaders, it's the same as layer_id */
@@ -221,7 +229,7 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
    return true;
 }
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10
 static bool
 lower_gl_pos_layer_writes(nir_builder *b, nir_instr *instr, void *data)
 {
@@ -453,8 +461,11 @@ panvk_preprocess_nir(struct vk_physical_device *vk_pdev,
    NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries,
             nir_shader_get_entrypoint(nir), nir_var_shader_out);
 
-#if PAN_ARCH < 9
-   /* This needs to be done just after the io_to_temporaries pass, because we
+#if PAN_ARCH < 10
+   /* With the JM backend, we issue one draw per layer and discard primitives
+    * written to other layers.
+    *
+    * This needs to be done just after the io_to_temporaries pass, because we
     * rely on out temporaries to collect the final layer_id value.
     */
    NIR_PASS(_, nir, lower_layer_writes);

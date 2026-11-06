@@ -415,6 +415,23 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
 }
 
 static void
+free_batch(struct panvk_cmd_buffer *cmdbuf, struct panvk_batch *batch)
+{
+   list_del(&batch->node);
+   util_dynarray_fini(&batch->jobs);
+   util_dynarray_fini(&batch->event_ops);
+
+   if (batch->done_sync) {
+      struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+      struct drm_syncobj_destroy destroy = {.handle = batch->done_sync};
+
+      pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
+   }
+
+   vk_free(&cmdbuf->vk.pool->alloc, batch);
+}
+
+static void
 panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
                    VkCommandBufferResetFlags flags)
 {
@@ -423,13 +440,8 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
 
    vk_command_buffer_reset(&cmdbuf->vk);
 
-   list_for_each_entry_safe(struct panvk_batch, batch, &cmdbuf->batches, node) {
-      list_del(&batch->node);
-      util_dynarray_fini(&batch->jobs);
-      util_dynarray_fini(&batch->event_ops);
-
-      vk_free(&cmdbuf->vk.pool->alloc, batch);
-   }
+   list_for_each_entry_safe(struct panvk_batch, batch, &cmdbuf->batches, node)
+      free_batch(cmdbuf, batch);
 
    panvk_pool_reset(&cmdbuf->desc_pool);
    panvk_pool_reset(&cmdbuf->tls_pool);
@@ -446,13 +458,8 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
       container_of(vk_cmdbuf, struct panvk_cmd_buffer, vk);
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
 
-   list_for_each_entry_safe(struct panvk_batch, batch, &cmdbuf->batches, node) {
-      list_del(&batch->node);
-      util_dynarray_fini(&batch->jobs);
-      util_dynarray_fini(&batch->event_ops);
-
-      vk_free(&cmdbuf->vk.pool->alloc, batch);
-   }
+   list_for_each_entry_safe(struct panvk_batch, batch, &cmdbuf->batches, node)
+      free_batch(cmdbuf, batch);
 
 #if PAN_ARCH < 9
    panvk_shader_link_cleanup(&cmdbuf->state.gfx.link);

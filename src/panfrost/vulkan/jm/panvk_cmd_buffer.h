@@ -64,6 +64,9 @@ struct panvk_batch {
     * this batch. Used to split the batch before the tiler heap runs out. */
    uint64_t vertex_count;
 #endif
+   /* Syncobj signaled when the last run of this batch is done, or 0 if the
+    * batch was never issued. */
+   uint32_t done_sync;
    bool issued;
 };
 

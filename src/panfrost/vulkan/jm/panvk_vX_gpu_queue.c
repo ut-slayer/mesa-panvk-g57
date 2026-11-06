@@ -31,6 +31,9 @@
 
 #include "drm-uapi/panfrost_drm.h"
 
+static void panvk_queue_transfer_sync(struct panvk_gpu_queue *queue,
+                                      uint32_t syncobj);
+
 static void
 panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
                          struct panvk_cmd_buffer *cmdbuf,
@@ -50,10 +53,11 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
        * for instance) re-submit per-swapchain-image command buffers as soon
        * as the image is acquired again, without waiting for their previous
        * submission, and rewriting descriptors that the GPU is still reading
-       * makes the jobs fail. The queue syncobj tracks the last submission,
-       * which comes after the previous run of this batch. */
-      ret = pan_kmod_sync_wait(dev->kmod.dev, &queue->sync, 1, INT64_MAX, 0,
-                               NULL);
+       * makes the jobs fail. Only wait for this batch, so that the work
+       * submitted after it can keep the GPU busy. */
+      assert(batch->done_sync);
+      ret = pan_kmod_sync_wait(dev->kmod.dev, &batch->done_sync, 1,
+                               INT64_MAX, 0, NULL);
       assert(!ret);
       util_dynarray_foreach(&batch->jobs, void *, job) {
          memset((*job), 0, 4 * 4);
@@ -178,6 +182,17 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
 
    if (PANVK_DEBUG(TRACE))
       pandecode_next_frame(dev->debug.decode_ctx);
+
+   /* The queue syncobj now tracks the last job chain of this batch: keep a
+    * copy, so that re-issuing the batch only waits for this run. */
+   if (!batch->done_sync) {
+      struct drm_syncobj_create create = {0};
+
+      ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_SYNCOBJ_CREATE, &create);
+      assert(!ret);
+      batch->done_sync = create.handle;
+   }
+   panvk_queue_transfer_sync(queue, batch->done_sync);
 
    batch->issued = true;
 }

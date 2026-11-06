@@ -64,6 +64,23 @@ struct panvk_batch {
     * this batch. Used to split the batch before the tiler heap runs out. */
    uint64_t vertex_count;
 #endif
+#if PAN_ARCH < 9
+   /* Group of small direct indexed draws whose index range is patched by a
+    * single helper job (see panvk_cmd_draw_indexed_direct()). */
+   struct {
+      /* struct libpan_draw_helper_indexed_direct_group, followed by the
+       * draws, or NULL if there's no open group. */
+      void *group;
+      void *job;
+      unsigned job_id;
+      /* Draws in the group so far. Kept here because the group lives in
+       * GPU memory, which is slow to read from the CPU. */
+      uint32_t count;
+      /* Upper bound of the poly heap bytes used by the varyings of these
+       * draws, to split the batch before the heap runs out. */
+      uint64_t varying_bytes;
+   } indexed_direct;
+#endif
    /* Syncobj signaled when the last run of this batch is done, or 0 if the
     * batch was never issued. */
    uint32_t done_sync;

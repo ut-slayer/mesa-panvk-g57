@@ -83,6 +83,9 @@ struct panvk_draw_data {
       uint64_t attribs;
       uint64_t attrib_bufs;
    } indirect_info;
+   /* Direct indexed draw whose index range is computed by the GPU (see
+    * panvk_cmd_draw_indexed_direct()). */
+   bool gpu_index_range;
 #else
    /* State shared by all the per-layer jobs of a draw. */
    uint64_t zsd;
@@ -99,6 +102,11 @@ struct panvk_draw_data {
 static bool
 is_indirect_draw(const struct panvk_draw_data *draw)
 {
+#if PAN_ARCH < 9
+   if (draw->gpu_index_range)
+      return false;
+#endif
+
    return draw->info.indirect.buffer_dev_addr != 0 ||
           draw->info.index.index_size != 0;
 }
@@ -533,7 +541,7 @@ panvk_draw_prepare_varyings(struct panvk_cmd_buffer *cmdbuf,
    for (unsigned i = 0; i < PANVK_VARY_BUF_MAX; i++) {
       uint32_t buf_size;
       uint64_t buf_addr;
-      if (is_indirect_draw(draw)) {
+      if (is_indirect_draw(draw) || draw->gpu_index_range) {
          buf_addr = dev->poly_heap.buffer->addr.dev;
          buf_size = 0;
       } else {
@@ -1033,6 +1041,13 @@ panvk_emit_tiler_primitive(struct panvk_cmd_buffer *cmdbuf,
 
       /* In case of indirect draw, the descriptor will be patched at runtime */
       cfg.index_count = is_indirect_draw(draw) ? 1 : draw->info.vertex.count;
+
+      /* With gpu_index_range, base_vertex_offset is patched at runtime. */
+      if (draw->gpu_index_range) {
+         cfg.indices = draw->info.index.buffer_dev_addr +
+                       (uint64_t)draw->info.index.offset *
+                          draw->info.index.index_size;
+      }
 
       cfg.low_depth_cull = cfg.high_depth_cull =
          vk_rasterization_state_depth_clip_enable(rs);
@@ -1815,6 +1830,318 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
    /* The VS push uniforms were patched by the GPU: make sure the next draw
     * doesn't reuse them. */
    gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
+}
+
+/* Above this many indices, the index range is searched by the parallel
+ * minmax helper before the patch job, instead of by the patch job itself. */
+#define INDEXED_DIRECT_INLINE_SEARCH_MAX 1024
+
+static bool
+can_use_indexed_direct_path(struct panvk_cmd_buffer *cmdbuf,
+                            uint32_t instance_count)
+{
+   uint32_t view_mask = cmdbuf->state.gfx.render.view_mask;
+   uint32_t layer_count = view_mask ? util_bitcount(view_mask)
+                                    : cmdbuf->state.gfx.render.layer_count;
+
+   return instance_count == 1 && layer_count <= 1;
+}
+
+/* Max number of draws patched by one group helper job. */
+#define INDEXED_DIRECT_GROUP_MAX 128
+
+/* Emits the helper job patching the small direct indexed draws of the
+ * batch, if there's no open group yet. The draws are added to the group by
+ * add_indexed_direct_group_draw(). */
+static VkResult
+get_indexed_direct_group(struct panvk_cmd_buffer *cmdbuf,
+                         unsigned init_heap_job_id)
+{
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+
+   if (batch->indexed_direct.group)
+      return VK_SUCCESS;
+
+   struct pan_ptr mem = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc,
+      sizeof(struct libpan_draw_helper_indexed_direct_group) +
+         INDEXED_DIRECT_GROUP_MAX *
+            sizeof(struct libpan_draw_helper_indexed_direct_draw),
+      8);
+   if (!mem.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   struct libpan_draw_helper_indexed_direct_group *group = mem.cpu;
+   group->count = 0;
+
+   struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+   const struct panlib_draw_indexed_direct_group_helper_args args = {
+      .group = mem.gpu,
+      .heap = panvk_priv_mem_dev_addr(dev->poly_heap.state),
+   };
+
+   /* The helper patches the jobs that follow it, so they must not be
+    * prefetched before it's done. */
+   panlib_draw_indexed_direct_group_helper_struct(
+      &precomp_ctx, panlib_1d_with_jm_deps(1, init_heap_job_id, 0),
+      PANLIB_BARRIER_JM_SUPPRESS_PREFETCH, args);
+
+   batch->indexed_direct.group = group;
+   batch->indexed_direct.job = util_dynarray_top(&batch->jobs, void *);
+   batch->indexed_direct.job_id = batch->vtc_jc.job_index;
+   batch->indexed_direct.count = 0;
+   return VK_SUCCESS;
+}
+
+static void
+add_indexed_direct_group_draw(
+   struct panvk_cmd_buffer *cmdbuf,
+   const struct libpan_draw_helper_indexed_direct_draw *draw)
+{
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+   struct libpan_draw_helper_indexed_direct_group *group =
+      batch->indexed_direct.group;
+   struct libpan_draw_helper_indexed_direct_draw *draws =
+      (struct libpan_draw_helper_indexed_direct_draw *)&group[1];
+
+   uint32_t count = batch->indexed_direct.count;
+
+   assert(count < INDEXED_DIRECT_GROUP_MAX);
+   draws[count++] = *draw;
+   group->count = count;
+   batch->indexed_direct.count = count;
+
+   /* One workgroup per draw: what pan_pack_work_groups_compute() gives for
+    * a (count, 1, 1) grid of (1, 1, 1) workgroups, without the loop. */
+   const uint32_t count_bits = util_logbase2_ceil(count);
+   pan_section_pack(batch->indexed_direct.job, COMPUTE_JOB, INVOCATION, cfg) {
+      cfg.invocations = count - 1;
+      cfg.workgroups_y_shift = count_bits;
+      cfg.workgroups_z_shift = count_bits;
+   }
+
+   if (count == INDEXED_DIRECT_GROUP_MAX)
+      batch->indexed_direct.group = NULL;
+}
+
+/* Direct indexed draws only need the index range from the GPU: the jobs are
+ * emitted like for a non-indexed draw, and a small helper patches the words
+ * that depend on the range. This avoids the full indirect draw path, which
+ * re-packs every descriptor on the GPU and costs tens of microseconds per
+ * draw.
+ */
+static void
+panvk_cmd_draw_indexed_direct(struct panvk_cmd_buffer *cmdbuf,
+                              struct panvk_draw_data *draw)
+{
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   const struct panvk_shader_variant *vs =
+      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+   VkResult result;
+
+   if (!panvk_priv_mem_check_alloc(vs->rsd))
+      return;
+
+   cmdbuf->state.gfx.fs.required =
+      fs_required(&cmdbuf->state.gfx, &cmdbuf->vk.dynamic_graphics_state);
+
+   bool patch_raw_vertex_offset =
+      shader_uses_sysval(vs, graphics, vs.raw_vertex_offset);
+   if (patch_raw_vertex_offset)
+      gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
+
+   result = prepare_draw(cmdbuf, draw);
+   if (result != VK_SUCCESS)
+      return;
+
+   /* Placeholder: the helper packs the real vertex range. */
+   memset(&draw->invocation, 0, sizeof(draw->invocation));
+
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+
+   unsigned init_heap_job_id;
+   result = panvk_per_arch(cmd_init_poly_heap)(cmdbuf, &init_heap_job_id);
+   if (result != VK_SUCCESS)
+      return;
+
+   /* Small draws are patched by the group helper of the batch, which runs
+    * before all their jobs. Bigger ones get their own helpers, after the
+    * parallel index range search. */
+   const bool use_group =
+      draw->info.vertex.count <= INDEXED_DIRECT_INLINE_SEARCH_MAX;
+   if (use_group) {
+      result = get_indexed_direct_group(cmdbuf, init_heap_job_id);
+      if (result != VK_SUCCESS)
+         return;
+   }
+
+   const unsigned group_job_id =
+      use_group ? batch->indexed_direct.job_id : 0;
+
+   unsigned copy_desc_job_id =
+      draw->jobs.vertex_copy_desc.gpu
+         ? pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_COMPUTE, false, false,
+                          group_job_id, 0, &draw->jobs.vertex_copy_desc, false)
+         : 0;
+
+   if (draw->jobs.frag_copy_desc.gpu) {
+      pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_COMPUTE, false, false, 0, 0,
+                     &draw->jobs.frag_copy_desc, false);
+   }
+
+   uint32_t view_mask = cmdbuf->state.gfx.render.view_mask;
+   const uint32_t layer = view_mask ? u_bit_scan(&view_mask) : 0;
+
+   result = prepare_draw_layer(cmdbuf, draw, layer);
+   if (result != VK_SUCCESS)
+      return;
+
+   const uint32_t index_size = draw->info.index.index_size;
+   const uint64_t indices = draw->info.index.buffer_dev_addr +
+                            (uint64_t)draw->info.index.offset * index_size;
+
+   const struct panvk_shader_link *link = &cmdbuf->state.gfx.link;
+   uint32_t varying_buf_mask = 0;
+   for (uint32_t i = 0; i < PANVK_VARY_BUF_MAX; i++) {
+      if (link->buf_strides[i]) {
+         varying_buf_mask |= BITFIELD_BIT(i);
+         /* The vertex range is usually close to the index count. */
+         batch->indexed_direct.varying_bytes +=
+            (uint64_t)draw->info.vertex.count * link->buf_strides[i] + 64;
+      }
+   }
+
+   const bool writes_point_size =
+      vs->info.vs.writes_point_size && draw->info.prim == MESA_PRIM_POINTS;
+   const uint64_t raw_vertex_offset_sysval =
+      patch_raw_vertex_offset
+         ? cmdbuf->state.gfx.vs.push_uniforms +
+              shader_remapped_sysval_offset(
+                 vs, sysval_offset(graphics, vs.raw_vertex_offset))
+         : 0;
+   const uint64_t idvs_job = vs->info.vs.idvs ? draw->jobs.idvs.gpu : 0;
+   const uint64_t vertex_job = vs->info.vs.idvs ? 0 : draw->jobs.vertex.gpu;
+   const uint64_t tiler_job = vs->info.vs.idvs ? 0 : draw->jobs.tiler.gpu;
+   unsigned helper_job_id;
+
+   if (use_group) {
+      const struct libpan_draw_helper_indexed_direct_draw group_draw = {
+         .indices = indices,
+         .varying_bufs_descs = draw->varying_bufs,
+         .raw_vertex_offset_sysval = raw_vertex_offset_sysval,
+         .idvs_job = idvs_job,
+         .vertex_job = vertex_job,
+         .tiler_job = tiler_job,
+         .vertex_offset = draw->info.vertex.base,
+         .index_count = draw->info.vertex.count,
+         .varying_buf_mask = varying_buf_mask,
+         .patch_psiz = writes_point_size,
+         .index_bytes_log2 = util_logbase2(index_size),
+         .primitive_restart = draw->info.index.restart_enable,
+      };
+
+      add_indexed_direct_group_draw(cmdbuf, &group_draw);
+      helper_job_id = copy_desc_job_id ? copy_desc_job_id : group_job_id;
+   } else {
+      struct panvk_precomp_ctx precomp_ctx =
+         panvk_per_arch(precomp_cs)(cmdbuf);
+      struct pan_ptr cmd = panvk_cmd_alloc_dev_mem(
+         cmdbuf, desc, sizeof(struct VkDrawIndexedIndirectCommand), 8);
+      struct pan_ptr res = panvk_cmd_alloc_dev_mem(
+         cmdbuf, desc, sizeof(struct libpan_draw_helper_index_min_max_result),
+         8);
+      if (!cmd.gpu || !res.gpu)
+         return;
+
+      *(struct VkDrawIndexedIndirectCommand *)cmd.cpu =
+         (struct VkDrawIndexedIndirectCommand){
+            .indexCount = draw->info.vertex.count,
+            .instanceCount = 1,
+            .firstIndex = draw->info.index.offset,
+         };
+      /* The patch job resets it after each use. */
+      *(struct libpan_draw_helper_index_min_max_result *)res.cpu =
+         (struct libpan_draw_helper_index_min_max_result){
+            .min = (uint32_t)(((uint64_t)1 << (index_size * 8)) - 1),
+            .max = 0,
+         };
+
+      const struct panlib_draw_index_minmax_search_helper_args minmax_args = {
+         .index_buffer_ptr = draw->info.index.buffer_dev_addr,
+         .cmd = cmd.gpu,
+         .min_ptr = res.gpu +
+                    offsetof(struct libpan_draw_helper_index_min_max_result, min),
+         .max_ptr = res.gpu +
+                    offsetof(struct libpan_draw_helper_index_min_max_result, max),
+      };
+
+      panlib_draw_index_minmax_search_helper_struct(
+         &precomp_ctx,
+         panlib_1d_with_jm_deps(DIV_ROUND_UP(draw->info.vertex.count, 65536),
+                                0, copy_desc_job_id),
+         PANLIB_BARRIER_NONE, minmax_args, util_logbase2(index_size),
+         draw->info.index.restart_enable);
+      unsigned minmax_job_id = batch->vtc_jc.job_index;
+
+      const struct panlib_draw_indexed_direct_helper_args args = {
+         .indices = indices,
+         .min_max_res = res.gpu,
+         .heap = panvk_priv_mem_dev_addr(dev->poly_heap.state),
+         .varying_bufs_descs = draw->varying_bufs,
+         .raw_vertex_offset_sysval = raw_vertex_offset_sysval,
+         .idvs_job = idvs_job,
+         .vertex_job = vertex_job,
+         .tiler_job = tiler_job,
+         .vertex_offset = draw->info.vertex.base,
+         .index_count = draw->info.vertex.count,
+         .varying_buf_mask = varying_buf_mask,
+         .patch_psiz = writes_point_size,
+      };
+
+      /* The helper patches the jobs that follow it, so they must not be
+       * prefetched before it's done. */
+      panlib_draw_indexed_direct_helper_struct(
+         &precomp_ctx,
+         panlib_1d_with_jm_deps(1, init_heap_job_id, minmax_job_id),
+         PANLIB_BARRIER_JM_SUPPRESS_PREFETCH, args, util_logbase2(index_size),
+         draw->info.index.restart_enable);
+      helper_job_id = batch->vtc_jc.job_index;
+   }
+
+   /* Tiler jobs get their global dependency replaced by the previous tiler
+    * job, so the dependency on the helper (and on the descriptor copy, which
+    * depends on the group helper) goes in the local one. */
+   if (vs->info.vs.idvs) {
+      pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_INDEXED_VERTEX, false,
+                     false, helper_job_id, 0, &draw->jobs.idvs, false);
+   } else {
+      unsigned vjob_id =
+         pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_VERTEX, false, false,
+                        helper_job_id, 0, &draw->jobs.vertex, false);
+
+      if (draw->jobs.tiler.gpu != 0) {
+         pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_TILER, false, false,
+                        vjob_id, 0, &draw->jobs.tiler, false);
+      }
+   }
+
+   /* The varyings are allocated from the poly heap, which is only reset when
+    * a batch starts using it: split the batch from time to time, like the
+    * indirect path does, and before the varyings fill the heap. */
+   if (batch->vtc_jc.job_index > (5 * 1024) ||
+       batch->indexed_direct.varying_bytes > PANVK_POLY_HEAP_SIZE / 2) {
+      panvk_per_arch(cmd_close_batch)(cmdbuf);
+      batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
+      cmdbuf->state.uses_poly_heap = false;
+   }
+
+   clear_dirty_after_draw(cmdbuf);
+
+   /* The raw vertex offset sysval was patched by the GPU: make sure the next
+    * draw doesn't reuse these push uniforms. */
+   if (patch_raw_vertex_offset)
+      gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
 }
 
 static unsigned
@@ -3154,6 +3481,26 @@ panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
 
    panvk_cmd_draw(cmdbuf, &draw);
 #else
+   if (can_use_indexed_direct_path(cmdbuf, instanceCount)) {
+      /* The vertex range and offset_start are patched by the GPU. */
+      struct panvk_draw_data draw = {
+         .info = {
+            .index = panvk_draw_info_index(cmdbuf, firstIndex),
+            .vertex.base = vertexOffset,
+            .vertex.count = indexCount,
+            .instance.base = firstInstance,
+            .instance.count = 1,
+            .prim = panvk_get_client_prim(cmdbuf),
+         },
+         .vertex_range = indexCount,
+         .padded_vertex_count = indexCount,
+         .gpu_index_range = true,
+      };
+
+      panvk_cmd_draw_indexed_direct(cmdbuf, &draw);
+      return;
+   }
+
    struct pan_ptr indirect_index_alloc = panvk_cmd_alloc_dev_mem(
       cmdbuf, desc, sizeof(struct VkDrawIndexedIndirectCommand), 8);
 

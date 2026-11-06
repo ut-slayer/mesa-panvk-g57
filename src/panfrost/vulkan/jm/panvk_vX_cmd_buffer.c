@@ -511,7 +511,7 @@ panvk_create_cmdbuf(struct vk_command_pool *vk_pool, VkCommandBufferLevel level,
          panvk_device_adjust_bo_flags(device, PAN_KMOD_BO_FLAG_WB_MMAP),
       .slab_size = 64 * 1024,
       .label = "Command buffer descriptor pool",
-      .prealloc = true,
+      .prealloc = false,
       .owns_bos = true,
       .needs_locking = false,
    };

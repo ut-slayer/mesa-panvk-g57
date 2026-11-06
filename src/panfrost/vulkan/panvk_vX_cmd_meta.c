@@ -30,6 +30,12 @@ copy_to_image_use_gfx_pipeline(struct panvk_image *dst_img)
    if (drm_is_afbc(dst_img->vk.drm_format_mod))
       return true;
 
+   /* On v9, image stores ignore the sample coordinate of a multisampled
+    * storage image (LEA_TEX only writes sample 0), so multisampled copies
+    * must go through the graphics pipeline too. */
+   if (PAN_ARCH == 9 && dst_img->vk.samples > VK_SAMPLE_COUNT_1_BIT)
+      return true;
+
    return false;
 }
 

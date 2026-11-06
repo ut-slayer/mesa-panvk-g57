@@ -10,6 +10,13 @@
 
 #pragma once
 
+struct libpan_draw_helper_attrib_info {
+    uint32_t base_offset;
+
+    /* When the attribute is per instance, the stride otherwise 0 */
+    uint32_t stride;
+};
+
 #if (PAN_ARCH == 6 || PAN_ARCH == 7)
 /* Keep in sync with panvk_varying_buf_id */
 enum panlib_varying_buf_id {
@@ -30,13 +37,6 @@ struct libpan_draw_helper_attrib_buf_info {
     uint32_t divisor;
     uint32_t stride;
     bool per_instance;
-};
-
-struct libpan_draw_helper_attrib_info {
-    uint32_t base_offset;
-
-    /* When the attribute is per instance, the stride otherwise 0 */
-    uint32_t stride;
 };
 
 /* A direct indexed draw patched by panlib_draw_indexed_direct_group_helper.

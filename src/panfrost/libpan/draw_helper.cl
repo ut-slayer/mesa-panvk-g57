@@ -898,19 +898,22 @@ panlib_patch_malloc_vertex_job(global uint8_t *job, uint32_t count,
 
 static void
 panlib_patch_vs_attribs(global struct mali_attribute_packed *attribs,
-                        global uint32_t *strides, uint32_t mask,
-                        uint32_t first_instance)
+                        global struct libpan_draw_helper_attrib_info *infos,
+                        uint32_t mask, uint32_t first_instance)
 {
-   /* Per-instance attributes start at base_instance * stride. The offset is
-    * word 2 of the attribute descriptor. It's patched directly because the
-    * descriptor has overlapping fields that wouldn't survive an
-    * unpack/pack round trip. */
+   /* Per-instance attributes start at base_offset + base_instance * stride.
+    * The offset is word 2 of the attribute descriptor. It's patched directly
+    * because the descriptor has overlapping fields that wouldn't survive an
+    * unpack/pack round trip, and written from the base offset (not
+    * accumulated) because the descriptors are re-patched every time the
+    * command buffer is submitted. */
    for (uint32_t i = 0; i < 32; i++) {
       if (!(mask & (1u << i)))
          continue;
 
       global int32_t *words = (global int32_t *)&attribs[i];
-      words[2] += (int32_t)(first_instance * strides[i]);
+      words[2] = (int32_t)(infos[i].base_offset +
+                           first_instance * infos[i].stride);
    }
 }
 
@@ -920,7 +923,7 @@ KERNEL(1)
 panlib_draw_indirect_helper(global VkDrawIndirectCommand *cmd,
                             global uint8_t *job,
                             global struct mali_attribute_packed *attribs,
-                            global uint32_t *attrib_strides,
+                            global struct libpan_draw_helper_attrib_info *attrib_infos,
                             global uint32_t *first_vertex_sysval,
                             global uint32_t *first_instance_sysval,
                             uint32_t attribs_mask)
@@ -929,7 +932,7 @@ panlib_draw_indirect_helper(global VkDrawIndirectCommand *cmd,
                                   cmd->firstVertex, 0);
 
    if (attribs_mask)
-      panlib_patch_vs_attribs(attribs, attrib_strides, attribs_mask,
+      panlib_patch_vs_attribs(attribs, attrib_infos, attribs_mask,
                               cmd->firstInstance);
 
    *first_vertex_sysval = cmd->firstVertex;
@@ -941,7 +944,7 @@ panlib_draw_indexed_indirect_helper(global VkDrawIndexedIndirectCommand *cmd,
                                     global uint8_t *job,
                                     global uint8_t *index_buffer_ptr,
                                     global struct mali_attribute_packed *attribs,
-                                    global uint32_t *attrib_strides,
+                                    global struct libpan_draw_helper_attrib_info *attrib_infos,
                                     global uint32_t *first_vertex_sysval,
                                     global uint32_t *first_instance_sysval,
                                     uint32_t attribs_mask, uint32_t index_size)
@@ -953,7 +956,7 @@ panlib_draw_indexed_indirect_helper(global VkDrawIndexedIndirectCommand *cmd,
                                   cmd->vertexOffset, indices);
 
    if (attribs_mask)
-      panlib_patch_vs_attribs(attribs, attrib_strides, attribs_mask,
+      panlib_patch_vs_attribs(attribs, attrib_infos, attribs_mask,
                               cmd->firstInstance);
 
    *first_vertex_sysval = cmd->vertexOffset;

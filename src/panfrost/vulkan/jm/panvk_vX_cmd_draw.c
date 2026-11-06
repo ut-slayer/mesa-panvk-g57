@@ -3311,20 +3311,27 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
    struct panvk_batch *batch = cmdbuf->cur_batch;
    const struct vk_vertex_input_state *vi = dyns->vi;
 
-   /* Per-instance attributes whose offset depends on the base instance. */
+   /* Per-instance attributes whose offset depends on the base instance. The
+    * helper writes base_offset + base_instance * stride: the descriptors
+    * were emitted with a base instance of 0, so this matches what the
+    * direct path does. */
    const uint32_t attribs_mask =
       cmdbuf->state.gfx.vi.attribs_changing_on_base_instance;
-   uint64_t attrib_strides = 0;
+   uint64_t attrib_infos = 0;
    if (attribs_mask) {
-      struct pan_ptr strides = panvk_cmd_alloc_dev_mem(
-         cmdbuf, desc, MAX_VS_ATTRIBS * sizeof(uint32_t), sizeof(uint32_t));
-      if (!strides.gpu)
+      struct pan_ptr infos = panvk_cmd_alloc_dev_mem(
+         cmdbuf, desc,
+         MAX_VS_ATTRIBS * sizeof(struct libpan_draw_helper_attrib_info),
+         sizeof(uint32_t));
+      if (!infos.gpu)
          return;
 
-      uint32_t *s = strides.cpu;
-      u_foreach_bit(i, attribs_mask)
-         s[i] = dyns->vi_binding_strides[vi->attributes[i].binding];
-      attrib_strides = strides.gpu;
+      struct libpan_draw_helper_attrib_info *info = infos.cpu;
+      u_foreach_bit(i, attribs_mask) {
+         info[i].base_offset = vi->attributes[i].offset;
+         info[i].stride = dyns->vi_binding_strides[vi->attributes[i].binding];
+      }
+      attrib_infos = infos.gpu;
    }
 
    STATIC_ASSERT(pan_size(ATTRIBUTE) == PANVK_DESCRIPTOR_SIZE);
@@ -3369,7 +3376,7 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
             .job = draw->job.gpu,
             .index_buffer_ptr = draw->info.index.buffer_dev_addr,
             .attribs = attribs,
-            .attrib_strides = attrib_strides,
+            .attrib_infos = attrib_infos,
             .first_vertex_sysval = first_vertex_sysval,
             .first_instance_sysval = first_instance_sysval,
             .attribs_mask = layer_attribs_mask,
@@ -3383,7 +3390,7 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
             .cmd = draw->info.indirect.buffer_dev_addr,
             .job = draw->job.gpu,
             .attribs = attribs,
-            .attrib_strides = attrib_strides,
+            .attrib_infos = attrib_infos,
             .first_vertex_sysval = first_vertex_sysval,
             .first_instance_sysval = first_instance_sysval,
             .attribs_mask = layer_attribs_mask,

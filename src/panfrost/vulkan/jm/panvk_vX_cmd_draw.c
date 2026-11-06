@@ -281,6 +281,32 @@ set_provoking_vertex_mode(struct panvk_cmd_buffer *cmdbuf,
       state->render.first_provoking_vertex = U_TRISTATE_YES;
 }
 
+/* Attributes whose descriptor depends on the base instance. */
+static void
+prepare_vi(struct panvk_cmd_buffer *cmdbuf)
+{
+   if (!dyn_gfx_state_dirty(cmdbuf, VI) &&
+       !dyn_gfx_state_dirty(cmdbuf, VI_BINDINGS_VALID))
+      return;
+
+   const struct vk_dynamic_graphics_state *dyns =
+      &cmdbuf->vk.dynamic_graphics_state;
+   const struct vk_vertex_input_state *vi = dyns->vi;
+
+   cmdbuf->state.gfx.vi.attribs_changing_on_base_instance = 0;
+   u_foreach_bit(i, vi->attributes_valid) {
+      const struct vk_vertex_binding_state *binding =
+         &vi->bindings[vi->attributes[i].binding];
+      const uint32_t stride =
+         dyns->vi_binding_strides[vi->attributes[i].binding];
+
+      if (binding->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE && stride != 0) {
+         cmdbuf->state.gfx.vi.attribs_changing_on_base_instance |=
+            BITFIELD_BIT(i);
+      }
+   }
+}
+
 #if PAN_ARCH < 9
 static VkResult
 panvk_draw_prepare_fs_rsd(struct panvk_cmd_buffer *cmdbuf,
@@ -769,16 +795,58 @@ panvk_draw_prepare_vs_attribs(struct panvk_cmd_buffer *cmdbuf,
    return VK_SUCCESS;
 }
 
-static void
+static bool
+vs_attribs_dirty(struct panvk_cmd_buffer *cmdbuf)
+{
+   if (cmdbuf->state.gfx.vi.attribs_changing_on_base_instance &&
+       gfx_state_dirty(cmdbuf, BASE_INSTANCE))
+      return true;
+
+   return !cmdbuf->state.gfx.vs.attrib_bufs ||
+          dyn_gfx_state_dirty(cmdbuf, VI) ||
+          dyn_gfx_state_dirty(cmdbuf, VI_BINDINGS_VALID) ||
+          dyn_gfx_state_dirty(cmdbuf, VI_BINDING_STRIDES) ||
+          gfx_state_dirty(cmdbuf, VB) || gfx_state_dirty(cmdbuf, VS) ||
+          gfx_state_dirty(cmdbuf, DESC_STATE);
+}
+
+/* The attribute descriptors of direct, non-instanced draws only depend on
+ * the vertex input state, the bound buffers and the base instance, so they
+ * are kept across draws until one of those changes. Instanced draws encode
+ * the padded vertex count, and indirect draws get them patched by the GPU:
+ * those always get fresh ones, which are not reused. */
+static VkResult
 panvk_draw_prepare_attributes(struct panvk_cmd_buffer *cmdbuf,
                               struct panvk_draw_data *draw)
 {
-   panvk_draw_prepare_vs_attribs(cmdbuf, draw);
+   const bool reusable =
+      !is_indirect_draw(draw) && draw->info.instance.count <= 1;
+
+   prepare_vi(cmdbuf);
+
+   if (cmdbuf->state.gfx.vi.base_instance != draw->info.instance.base) {
+      cmdbuf->state.gfx.vi.base_instance = draw->info.instance.base;
+      gfx_state_set_dirty(cmdbuf, BASE_INSTANCE);
+   }
+
+   if (!reusable || vs_attribs_dirty(cmdbuf)) {
+      VkResult result = panvk_draw_prepare_vs_attribs(cmdbuf, draw);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
    draw->vs.attributes = cmdbuf->state.gfx.vs.attribs;
    draw->vs.attribute_bufs = cmdbuf->state.gfx.vs.attrib_bufs;
    draw->indirect_info.attribs = cmdbuf->state.gfx.vs.indirect_attribs_infos;
    draw->indirect_info.attrib_bufs =
       cmdbuf->state.gfx.vs.indirect_attrib_bufs_infos;
+
+   if (!reusable) {
+      cmdbuf->state.gfx.vs.attribs = 0;
+      cmdbuf->state.gfx.vs.attrib_bufs = 0;
+   }
+
+   return VK_SUCCESS;
 }
 
 static void
@@ -1312,7 +1380,9 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
    /* This allocates and initializes the image table, which we need before we
     * can copy descriptors.
     */
-   panvk_draw_prepare_attributes(cmdbuf, draw);
+   result = panvk_draw_prepare_attributes(cmdbuf, draw);
+   if (result != VK_SUCCESS)
+      return result;
 
    if (gfx_state_dirty(cmdbuf, DESC_STATE) || gfx_state_dirty(cmdbuf, VS)) {
       result = panvk_draw_prepare_vs_copy_desc_job(cmdbuf, draw);
@@ -1380,18 +1450,28 @@ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
 
    draw->info.layer_id = layer;
    if (draw->info.layer_id > 0) {
+      /* Both shaders may read layer_id: on JM, gl_Layer is a sysval. */
       cmdbuf->state.gfx.sysvals.layer_id = draw->info.layer_id;
+      gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
       gfx_state_set_dirty(cmdbuf, FS_PUSH_UNIFORMS);
    }
 
-   struct pan_ptr vs_push_uniforms;
-   result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
-      cmdbuf, vs, &vs_push_uniforms, 1);
-   if (result != VK_SUCCESS)
-      return result;
-   cmdbuf->state.gfx.vs.push_uniforms = vs_push_uniforms.gpu;
+   /* The push uniforms only change when a sysval the shader reads or a push
+    * constant changes, which flags them dirty: reuse the previous block
+    * otherwise. The command buffer reset clears the pointers, so the first
+    * draw always emits them. */
+   if (gfx_state_dirty(cmdbuf, VS_PUSH_UNIFORMS) ||
+       !cmdbuf->state.gfx.vs.push_uniforms) {
+      struct pan_ptr vs_push_uniforms;
+      result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
+         cmdbuf, vs, &vs_push_uniforms, 1);
+      if (result != VK_SUCCESS)
+         return result;
+      cmdbuf->state.gfx.vs.push_uniforms = vs_push_uniforms.gpu;
+   }
 
-   if (fs) {
+   if (fs && (gfx_state_dirty(cmdbuf, FS_PUSH_UNIFORMS) ||
+              !cmdbuf->state.gfx.fs.push_uniforms)) {
       struct pan_ptr fs_push_uniforms;
       result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
          cmdbuf, fs, &fs_push_uniforms, 1);
@@ -1731,6 +1811,10 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
    }
 
    clear_dirty_after_draw(cmdbuf);
+
+   /* The VS push uniforms were patched by the GPU: make sure the next draw
+    * doesn't reuse them. */
+   gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
 }
 
 static unsigned
@@ -1767,31 +1851,6 @@ padded_vertex_count(struct panvk_cmd_buffer *cmdbuf, uint32_t vertex_count,
  * below mirrors csf/panvk_vX_cmd_draw.c, the job layout mirrors
  * jm_emit_malloc_vertex_job() in the Gallium driver.
  */
-
-static void
-prepare_vi(struct panvk_cmd_buffer *cmdbuf)
-{
-   if (!dyn_gfx_state_dirty(cmdbuf, VI) &&
-       !dyn_gfx_state_dirty(cmdbuf, VI_BINDINGS_VALID))
-      return;
-
-   const struct vk_dynamic_graphics_state *dyns =
-      &cmdbuf->vk.dynamic_graphics_state;
-   const struct vk_vertex_input_state *vi = dyns->vi;
-
-   cmdbuf->state.gfx.vi.attribs_changing_on_base_instance = 0;
-   u_foreach_bit(i, vi->attributes_valid) {
-      const struct vk_vertex_binding_state *binding =
-         &vi->bindings[vi->attributes[i].binding];
-      const uint32_t stride =
-         dyns->vi_binding_strides[vi->attributes[i].binding];
-
-      if (binding->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE && stride != 0) {
-         cmdbuf->state.gfx.vi.attribs_changing_on_base_instance |=
-            BITFIELD_BIT(i);
-      }
-   }
-}
 
 static void
 emit_vs_attrib(struct panvk_cmd_buffer *cmdbuf, uint32_t attrib_idx,

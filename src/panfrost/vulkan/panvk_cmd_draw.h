@@ -209,12 +209,10 @@ struct panvk_cmd_graphics_state {
       unsigned count;
    } vb;
 
-#if PAN_ARCH >= 9
    struct {
       uint32_t base_instance;
       uint32_t attribs_changing_on_base_instance;
    } vi;
-#endif
 
    /* Index buffer */
    struct {

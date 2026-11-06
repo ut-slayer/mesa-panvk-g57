@@ -854,17 +854,19 @@ panlib_patch_malloc_vertex_job(global uint8_t *job, uint32_t count,
 {
    global struct mali_job_header_packed *header =
       (global struct mali_job_header_packed *)job;
+   const bool empty = count == 0 || instance_count == 0;
 
    /* Nothing to draw: turn the job into a NULL job, which keeps the job
-    * chain dependencies intact. */
-   if (count == 0 || instance_count == 0) {
-      pan_unpack(header, JOB_HEADER, unpacked_header);
-      pan_pack(header, JOB_HEADER, cfg) {
-         memcpy(&cfg, &unpacked_header, sizeof(cfg));
-         cfg.type = MALI_JOB_TYPE_NULL;
-      }
-      return;
+    * chain dependencies intact. The type is written in both cases because
+    * the command buffer can be re-submitted with different parameters. */
+   pan_unpack(header, JOB_HEADER, unpacked_header);
+   pan_pack(header, JOB_HEADER, cfg) {
+      memcpy(&cfg, &unpacked_header, sizeof(cfg));
+      cfg.type = empty ? MALI_JOB_TYPE_NULL : MALI_JOB_TYPE_MALLOC_VERTEX;
    }
+
+   if (empty)
+      return;
 
    global struct mali_primitive_packed *prim =
       (global struct mali_primitive_packed *)(job + pan_section_offset(

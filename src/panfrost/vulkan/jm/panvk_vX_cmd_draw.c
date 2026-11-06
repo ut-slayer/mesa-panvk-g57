@@ -2943,6 +2943,8 @@ panvk_draw_prepare_malloc_vertex_job(struct panvk_cmd_buffer *cmdbuf,
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
    util_dynarray_append(&batch->jobs, ptr.cpu);
+   util_dynarray_append(&batch->idvs_dcds,
+                        pan_section_ptr(ptr.cpu, MALLOC_VERTEX_JOB, DRAW));
    draw->job = ptr;
 
    panvk_emit_primitive(cmdbuf, draw, secondary_shader,

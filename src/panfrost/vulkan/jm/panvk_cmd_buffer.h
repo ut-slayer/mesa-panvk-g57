@@ -63,6 +63,11 @@ struct panvk_batch {
    /* Vertices (indices x instances x layers) issued by the direct draws of
     * this batch. Used to split the batch before the tiler heap runs out. */
    uint64_t vertex_count;
+
+   /* CPU pointers to the DCDs of the MALLOC_VERTEX jobs: the hardware
+    * writes their vertex array fields, which are restored when the batch is
+    * re-issued. */
+   struct util_dynarray idvs_dcds;
 #endif
 #if PAN_ARCH < 9
    /* Group of small direct indexed draws whose index range is patched by a

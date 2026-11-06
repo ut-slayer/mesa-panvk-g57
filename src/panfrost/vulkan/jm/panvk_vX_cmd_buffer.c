@@ -343,6 +343,9 @@ panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
                 VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    cmdbuf->cur_batch->jobs = UTIL_DYNARRAY_INIT;
    cmdbuf->cur_batch->event_ops = UTIL_DYNARRAY_INIT;
+#if PAN_ARCH >= 9
+   cmdbuf->cur_batch->idvs_dcds = UTIL_DYNARRAY_INIT;
+#endif
    assert(cmdbuf->cur_batch);
    return cmdbuf->cur_batch;
 }
@@ -420,6 +423,9 @@ free_batch(struct panvk_cmd_buffer *cmdbuf, struct panvk_batch *batch)
    list_del(&batch->node);
    util_dynarray_fini(&batch->jobs);
    util_dynarray_fini(&batch->event_ops);
+#if PAN_ARCH >= 9
+   util_dynarray_fini(&batch->idvs_dcds);
+#endif
 
    if (batch->done_sync) {
       struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);

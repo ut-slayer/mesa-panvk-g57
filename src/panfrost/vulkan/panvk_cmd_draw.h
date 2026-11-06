@@ -161,6 +161,10 @@ struct panvk_cmd_graphics_state {
    struct panvk_prims_generated_query_state prims_generated_query;
 #endif
    struct panvk_graphics_sysvals sysvals;
+#if PAN_ARCH < 10
+   /* Index of the current draw in a vkCmdDrawMulti*EXT() call, 0 otherwise. */
+   uint32_t draw_id;
+#endif
 
 #if PAN_ARCH < 9
    struct panvk_shader_link link;

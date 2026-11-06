@@ -876,6 +876,8 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
 #endif
 #if PAN_ARCH < 10
    set_gfx_sysval(cmdbuf, dirty_sysvals, layer_id, info->layer_id);
+   set_gfx_sysval(cmdbuf, dirty_sysvals, vs.draw_id,
+                  cmdbuf->state.gfx.draw_id);
 #endif
 
    if (dyn_gfx_state_dirty(cmdbuf, CB_BLEND_CONSTANTS)) {

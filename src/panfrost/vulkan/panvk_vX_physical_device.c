@@ -190,6 +190,8 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_memory_budget = true,
       .EXT_non_seamless_cube_map = true,
       .EXT_mutable_descriptor_type = PAN_ARCH >= 9,
+      /* On JM, implemented as a loop of single draws. */
+      .EXT_multi_draw = PAN_ARCH < 10,
       .EXT_multisampled_render_to_single_sampled = true,
       .EXT_physical_device_drm = true,
       .EXT_pipeline_creation_cache_control = true,
@@ -779,6 +781,9 @@ panvk_per_arch(get_physical_device_features)(
       /* VK_EXT_multisampled_render_to_single_sampled */
       .multisampledRenderToSingleSampled = true,
 
+      /* VK_EXT_multi_draw */
+      .multiDraw = PAN_ARCH < 10,
+
 #ifdef PANVK_USE_WSI_PLATFORM
       /* VK_EXT_present_timing */
       .presentTiming = true,
@@ -1306,6 +1311,9 @@ panvk_per_arch(get_physical_device_properties)(
 
       /* VK_EXT_map_memory_placed */
       .minPlacedMemoryMapAlignment = os_page_size,
+
+      /* VK_EXT_multi_draw */
+      .maxMultiDrawCount = UINT16_MAX,
 
       /* VK_EXT_provoking_vertex */
       .provokingVertexModePerPipeline = false,

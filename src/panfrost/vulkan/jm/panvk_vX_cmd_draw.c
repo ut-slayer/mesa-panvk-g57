@@ -3235,3 +3235,41 @@ panvk_per_arch(CmdEndRendering2KHR)(
       panvk_per_arch(cmd_meta_resolve_attachments)(cmdbuf);
    }
 }
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawMultiEXT)(VkCommandBuffer commandBuffer,
+                                uint32_t drawCount,
+                                const VkMultiDrawInfoEXT *pVertexInfo,
+                                uint32_t instanceCount, uint32_t firstInstance,
+                                uint32_t stride)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   unsigned i = 0;
+
+   vk_foreach_multi_draw(draw, i, pVertexInfo, drawCount, stride) {
+      cmdbuf->state.gfx.draw_id = i;
+      panvk_per_arch(CmdDraw)(commandBuffer, draw->vertexCount, instanceCount,
+                              draw->firstVertex, firstInstance);
+   }
+
+   cmdbuf->state.gfx.draw_id = 0;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawMultiIndexedEXT)(
+   VkCommandBuffer commandBuffer, uint32_t drawCount,
+   const VkMultiDrawIndexedInfoEXT *pIndexInfo, uint32_t instanceCount,
+   uint32_t firstInstance, uint32_t stride, const int32_t *pVertexOffset)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   unsigned i = 0;
+
+   vk_foreach_multi_draw_indexed(draw, i, pIndexInfo, drawCount, stride) {
+      cmdbuf->state.gfx.draw_id = i;
+      panvk_per_arch(CmdDrawIndexed)(
+         commandBuffer, draw->indexCount, instanceCount, draw->firstIndex,
+         pVertexOffset ? *pVertexOffset : draw->vertexOffset, firstInstance);
+   }
+
+   cmdbuf->state.gfx.draw_id = 0;
+}

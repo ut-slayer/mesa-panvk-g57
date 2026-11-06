@@ -362,6 +362,25 @@ bi_optimize_late(nir_shader *nir, unsigned arch,
    NIR_PASS(_, nir, nir_opt_gcm, false /* value_number */);
    NIR_PASS(_, nir, nir_opt_dce);
 
+   /* v9 takes the resource handle of LD_PKA/LEA_PKA from a single lane:
+    * serialize buffer accesses with a divergent handle. This runs before the
+    * boolean lowering so the lane compares get lowered too, and the 64-bit
+    * phis it creates for load_ssbo_address need the int64 lowering. */
+   if (arch == 9 && (nir->info.num_ssbos || nir->info.num_ubos)) {
+      bool progress = false;
+
+      nir_divergence_analysis(nir);
+      NIR_PASS(progress, nir, bi_lower_divergent_indirects,
+               pan_subgroup_size(arch), true);
+      if (progress) {
+         NIR_PASS(_, nir, nir_lower_64bit_phis);
+         NIR_PASS(_, nir, nir_lower_int64);
+         NIR_PASS(_, nir, nir_lower_phis_to_scalar, bi_vectorize_filter,
+                  &arch);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+   }
+
    NIR_PASS(_, nir, pan_nir_lower_bool_to_bitsize);
    NIR_PASS(_, nir, nir_lower_alu_width, bi_vectorize_filter, &arch);
    NIR_PASS(_, nir, nir_opt_vectorize, bi_vectorize_filter, &arch);
@@ -401,7 +420,8 @@ bi_optimize_late(nir_shader *nir, unsigned arch,
 
    if (any_indirects) {
       nir_divergence_analysis(nir);
-      NIR_PASS(_, nir, bi_lower_divergent_indirects, pan_subgroup_size(arch));
+      NIR_PASS(_, nir, bi_lower_divergent_indirects, pan_subgroup_size(arch),
+               false);
    }
 }
 

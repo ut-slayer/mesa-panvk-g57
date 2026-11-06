@@ -17,12 +17,22 @@
  *   ...
  *   else if (lane == MAX_LANE)
  *      value = ld()
+ *
+ * On v9, the resource handle of LD_PKA/LEA_PKA is also taken from a single
+ * lane, so buffer accesses whose handle diverges (variable pointers selecting
+ * between buffers per invocation) are lowered the same way.
  */
+
+struct lower_divergent_indirects_opts {
+   unsigned lanes;
+   bool buffer_handles;
+};
 
 static bool
 bi_lower_divergent_indirects_impl(nir_builder *b, nir_intrinsic_instr *intr,
                                   void *data)
 {
+   const struct lower_divergent_indirects_opts *opts = data;
    mesa_shader_stage stage = b->shader->info.stage;
    nir_src *offset;
 
@@ -58,6 +68,17 @@ bi_lower_divergent_indirects_impl(nir_builder *b, nir_intrinsic_instr *intr,
       /* Any image access */
       offset = &intr->src[0];
       break;
+
+   case nir_intrinsic_load_ubo:
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_load_ssbo_address:
+      /* Buffer resource handle (SSBO stores and atomics go through
+       * load_ssbo_address after nir_lower_ssbo) */
+      if (!opts->buffer_handles)
+         return false;
+
+      offset = &intr->src[0];
+      break;
    default:
       return false;
    }
@@ -69,7 +90,6 @@ bi_lower_divergent_indirects_impl(nir_builder *b, nir_intrinsic_instr *intr,
 
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *lane = nir_load_subgroup_invocation(b);
-   unsigned *lanes = data;
 
    /* Write zero in a funny way to bypass lower_load_const_to_scalar */
    bool has_dest = nir_intrinsic_infos[intr->intrinsic].has_dest;
@@ -79,7 +99,7 @@ bi_lower_divergent_indirects_impl(nir_builder *b, nir_intrinsic_instr *intr,
    nir_def *res =
       has_dest ? nir_vec(b, zeroes, intr->def.num_components) : NULL;
 
-   for (unsigned i = 0; i < (*lanes); ++i) {
+   for (unsigned i = 0; i < opts->lanes; ++i) {
       nir_push_if(b, nir_ieq_imm(b, lane, i));
 
       nir_instr *c = nir_instr_clone(b->shader, &intr->instr);
@@ -101,8 +121,14 @@ bi_lower_divergent_indirects_impl(nir_builder *b, nir_intrinsic_instr *intr,
 }
 
 bool
-bi_lower_divergent_indirects(nir_shader *shader, unsigned lanes)
+bi_lower_divergent_indirects(nir_shader *shader, unsigned lanes,
+                             bool buffer_handles)
 {
+   struct lower_divergent_indirects_opts opts = {
+      .lanes = lanes,
+      .buffer_handles = buffer_handles,
+   };
+
    return nir_shader_intrinsics_pass(shader, bi_lower_divergent_indirects_impl,
-                                     nir_metadata_none, &lanes);
+                                     nir_metadata_none, &opts);
 }

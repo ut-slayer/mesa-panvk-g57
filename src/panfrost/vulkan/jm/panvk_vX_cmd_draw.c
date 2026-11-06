@@ -3393,10 +3393,12 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
             args);
       }
 
-      /* The draw job depends on the helper job that patches it. */
+      /* The draw job depends on the helper job that patches it. This goes
+       * in the first dependency slot: pan_jc_add_job() overrides the second
+       * one with the previous tiling job of the chain. */
       uint32_t helper_job = batch->vtc_jc.job_index;
       pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_MALLOC_VERTEX, false, false,
-                     0, helper_job, &draw->job, false);
+                     helper_job, 0, &draw->job, false);
    }
 
    /* The attribute descriptors were patched with the indirect base

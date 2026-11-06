@@ -223,7 +223,12 @@ panvk_per_arch(nir_lower_input_attachment_loads)(
 {
    bool progress = false;
    struct panvk_lower_input_attachment_load_ctx ia_load_ctx = {
+#if PAN_ARCH == 9
+      /* v9 has no resource wait for LD_TILE: always do a full wait. */
+      .ro_color_mask = 0,
+#else
       .ro_color_mask = readonly_color_mask(nir, state),
+#endif
    };
 
    NIR_PASS(progress, nir, nir_shader_intrinsics_pass,

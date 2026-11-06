@@ -38,4 +38,28 @@ struct libpan_draw_helper_attrib_info {
     /* When the attribute is per instance, the stride otherwise 0 */
     uint32_t stride;
 };
+
+/* A direct indexed draw patched by panlib_draw_indexed_direct_group_helper.
+ * Pointers are GPU addresses, 0 when unused. */
+struct libpan_draw_helper_indexed_direct_draw {
+    uint64_t indices;
+    uint64_t varying_bufs_descs;
+    uint64_t raw_vertex_offset_sysval;
+    uint64_t idvs_job;
+    uint64_t vertex_job;
+    uint64_t tiler_job;
+    int32_t vertex_offset;
+    uint32_t index_count;
+    uint32_t varying_buf_mask;
+    uint8_t patch_psiz;
+    uint8_t index_bytes_log2;
+    uint8_t primitive_restart;
+    uint8_t pad;
+};
+
+/* Header of the draw array of a group helper: draws follow it. */
+struct libpan_draw_helper_indexed_direct_group {
+    uint32_t count;
+    uint32_t pad;
+};
 #endif

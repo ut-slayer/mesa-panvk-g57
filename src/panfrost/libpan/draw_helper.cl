@@ -633,6 +633,212 @@ panlib_draw_index_minmax_search_helper(global uint8_t *index_buffer_ptr,
    atomic_fetch_min(min_ptr, local_min);
    atomic_fetch_max(max_ptr, local_max);
 }
+
+/* Direct, non-instanced indexed draws: the driver emits the jobs like for a
+ * non-indexed draw, and this only patches the few words that depend on the
+ * index range, instead of re-packing every descriptor like the indirect
+ * helpers do. The range is searched here, or by
+ * panlib_draw_index_minmax_search_helper if min_max_res is not NULL. In that
+ * case, the result is reset for the next execution of the command buffer, so
+ * no WRITE_VALUE job is needed to initialize it.
+ */
+static inline void
+panlib_patch_indexed_direct_draw(
+   global uint8_t *indices,
+   global struct libpan_draw_helper_index_min_max_result *min_max_res,
+   global struct poly_heap *heap,
+   global struct mali_attribute_buffer_packed *varying_bufs_descs,
+   global int32_t *raw_vertex_offset_sysval, global uint8_t *idvs_job,
+   global uint8_t *vertex_job, global uint8_t *tiler_job,
+   int32_t vertex_offset, uint32_t index_count, uint32_t varying_buf_mask,
+   uint32_t patch_psiz, uint32_t index_bytes_log2__3,
+   uint8_t primitive_restart__2)
+{
+   const uint32_t index_bit_size = (1 << index_bytes_log2__3) * 8;
+   const uint32_t no_min = (uint32_t)(((uint64_t)1 << index_bit_size) - 1);
+   uint32_t min_vertex = no_min;
+   uint32_t max_vertex = 0;
+
+   if (min_max_res != NULL) {
+      min_vertex = min_max_res->min;
+      max_vertex = min_max_res->max;
+      min_max_res->min = no_min;
+      min_max_res->max = 0;
+   } else {
+      switch (index_bit_size) {
+#define MINMAX_SEARCH_CASE(sz)                                                 \
+   case sz: {                                                                  \
+      global uint##sz##_t *idx = (global uint##sz##_t *)indices;               \
+      for (uint32_t i = 0; i < index_count; i++) {                             \
+         uint32_t val = (uint32_t)idx[i];                                      \
+         if (primitive_restart__2 && val == UINT##sz##_MAX)                    \
+            continue;                                                          \
+         min_vertex = min(min_vertex, val);                                    \
+         max_vertex = max(max_vertex, val);                                    \
+      }                                                                        \
+      break;                                                                   \
+   }
+         MINMAX_SEARCH_CASE(32)
+         MINMAX_SEARCH_CASE(16)
+         MINMAX_SEARCH_CASE(8)
+#undef MINMAX_SEARCH_CASE
+      default:
+         assert(0 && "Invalid index size");
+      }
+   }
+
+   /* Only restart indices: nothing to draw. The job types are written on
+    * every execution, since the previous one might have changed them. */
+   bool is_null_job = max_vertex < min_vertex;
+
+   if (idvs_job != NULL) {
+      panlib_patch_job_type_header(
+         (global struct mali_job_header_packed *)idvs_job,
+         is_null_job ? MALI_JOB_TYPE_NULL : MALI_JOB_TYPE_INDEXED_VERTEX);
+   } else {
+      panlib_patch_job_type_header(
+         (global struct mali_job_header_packed *)vertex_job,
+         is_null_job ? MALI_JOB_TYPE_NULL : MALI_JOB_TYPE_VERTEX);
+      panlib_patch_job_type_header(
+         (global struct mali_job_header_packed *)tiler_job,
+         is_null_job ? MALI_JOB_TYPE_NULL : MALI_JOB_TYPE_TILER);
+   }
+
+   if (is_null_job)
+      return;
+
+   const uint32_t vertex_range = max_vertex - min_vertex + 1;
+   const int32_t raw_offset = (int32_t)min_vertex + vertex_offset;
+   uint64_t position = 0, psiz = 0;
+
+   for (uint32_t i = 0; i < PANLIB_VARY_BUF_MAX; i++) {
+      if (!(varying_buf_mask & BITFIELD_BIT(i)))
+         continue;
+
+      global uint32_t *words = (global uint32_t *)&varying_bufs_descs[i];
+      uint32_t stride = words[2];
+      uint32_t size = vertex_range * stride;
+      uint64_t ptr = (uint64_t)poly_heap_alloc(heap, size, 64);
+
+      pan_pack(&varying_bufs_descs[i], ATTRIBUTE_BUFFER, cfg) {
+         cfg.type = MALI_ATTRIBUTE_TYPE_1D;
+         cfg.pointer = ptr;
+         cfg.stride = stride;
+         cfg.size = size;
+      }
+
+      if (i == PANLIB_VARY_BUF_POSITION)
+         position = ptr;
+      else if (i == PANLIB_VARY_BUF_PSIZ)
+         psiz = ptr;
+   }
+
+   /* DRAW: word 1 is offset_start, words 4-5 are the position pointer.
+    * PRIMITIVE: word 1 is base_vertex_offset. PRIMITIVE_SIZE: words 0-1 are
+    * the point size array pointer. */
+   global struct mali_invocation_packed *invocation;
+   global uint32_t *vertex_dcd, *tiler_dcd = NULL, *primitive, *primsz;
+
+   if (idvs_job != NULL) {
+      invocation = (global struct mali_invocation_packed *)(idvs_job +
+         pan_section_offset(INDEXED_VERTEX_JOB, INVOCATION));
+      vertex_dcd = (global uint32_t *)(idvs_job +
+         pan_section_offset(INDEXED_VERTEX_JOB, VERTEX_DRAW));
+      tiler_dcd = (global uint32_t *)(idvs_job +
+         pan_section_offset(INDEXED_VERTEX_JOB, FRAGMENT_DRAW));
+      primitive = (global uint32_t *)(idvs_job +
+         pan_section_offset(INDEXED_VERTEX_JOB, PRIMITIVE));
+      primsz = (global uint32_t *)(idvs_job +
+         pan_section_offset(INDEXED_VERTEX_JOB, PRIMITIVE_SIZE));
+   } else {
+      invocation = (global struct mali_invocation_packed *)(vertex_job +
+         pan_section_offset(COMPUTE_JOB, INVOCATION));
+      vertex_dcd = (global uint32_t *)(vertex_job +
+         pan_section_offset(COMPUTE_JOB, DRAW));
+      if (tiler_job != NULL) {
+         tiler_dcd = (global uint32_t *)(tiler_job +
+            pan_section_offset(TILER_JOB, DRAW));
+         primitive = (global uint32_t *)(tiler_job +
+            pan_section_offset(TILER_JOB, PRIMITIVE));
+         primsz = (global uint32_t *)(tiler_job +
+            pan_section_offset(TILER_JOB, PRIMITIVE_SIZE));
+      }
+   }
+
+   pan_pack_work_groups_compute(invocation, 1, vertex_range, 1, 1, 1, 1, true,
+                                false);
+   vertex_dcd[1] = raw_offset;
+
+   if (raw_vertex_offset_sysval != NULL)
+      *raw_vertex_offset_sysval = raw_offset;
+
+   /* No tiler job, nothing else to patch. */
+   if (tiler_dcd == NULL)
+      return;
+
+   if (idvs_job == NULL) {
+      global struct mali_invocation_packed *tiler_invocation =
+         (global struct mali_invocation_packed *)(tiler_job +
+            pan_section_offset(TILER_JOB, INVOCATION));
+      memcpy(tiler_invocation, invocation, pan_size(INVOCATION));
+   }
+
+   tiler_dcd[1] = raw_offset;
+   tiler_dcd[4] = (uint32_t)position;
+   tiler_dcd[5] = (uint32_t)(position >> 32);
+   primitive[1] = vertex_offset - raw_offset;
+
+   if (patch_psiz) {
+      primsz[0] = (uint32_t)psiz;
+      primsz[1] = (uint32_t)(psiz >> 32);
+   }
+}
+KERNEL(1)
+panlib_draw_indexed_direct_helper(
+   global uint8_t *indices,
+   global struct libpan_draw_helper_index_min_max_result *min_max_res,
+   global struct poly_heap *heap,
+   global struct mali_attribute_buffer_packed *varying_bufs_descs,
+   global int32_t *raw_vertex_offset_sysval, global uint8_t *idvs_job,
+   global uint8_t *vertex_job, global uint8_t *tiler_job,
+   int32_t vertex_offset, uint32_t index_count, uint32_t varying_buf_mask,
+   uint32_t patch_psiz, uint32_t index_bytes_log2__3,
+   uint8_t primitive_restart__2)
+{
+   panlib_patch_indexed_direct_draw(
+      indices, min_max_res, heap, varying_bufs_descs, raw_vertex_offset_sysval,
+      idvs_job, vertex_job, tiler_job, vertex_offset, index_count,
+      varying_buf_mask, patch_psiz, index_bytes_log2__3, primitive_restart__2);
+}
+
+/* Patches a group of small direct indexed draws of a batch at once, one
+ * workgroup per draw. It runs before the jobs of all these draws: within a
+ * batch, nothing can write an index buffer before a draw reads it, since
+ * barriers split batches.
+ */
+KERNEL(1)
+panlib_draw_indexed_direct_group_helper(
+   global struct libpan_draw_helper_indexed_direct_group *group,
+   global struct poly_heap *heap)
+{
+   uint32_t draw_id = cl_group_id.x;
+
+   if (draw_id >= group->count)
+      return;
+
+   global struct libpan_draw_helper_indexed_direct_draw *draw =
+      &((global struct libpan_draw_helper_indexed_direct_draw *)&group[1])
+         [draw_id];
+
+   panlib_patch_indexed_direct_draw(
+      (global uint8_t *)draw->indices, NULL, heap,
+      (global struct mali_attribute_buffer_packed *)draw->varying_bufs_descs,
+      (global int32_t *)draw->raw_vertex_offset_sysval,
+      (global uint8_t *)draw->idvs_job, (global uint8_t *)draw->vertex_job,
+      (global uint8_t *)draw->tiler_job, draw->vertex_offset,
+      draw->index_count, draw->varying_buf_mask, draw->patch_psiz,
+      draw->index_bytes_log2, draw->primitive_restart);
+}
 #else /* PAN_ARCH == 9 */
 
 /* v9 (Valhall + JM) indirect draws: the driver emits a MALLOC_VERTEX_JOB with

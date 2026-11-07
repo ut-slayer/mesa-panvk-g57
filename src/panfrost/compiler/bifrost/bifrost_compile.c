@@ -4649,7 +4649,13 @@ bi_compile_variant(nir_shader *nir,
    ralloc_free(ctx);
 }
 
-/* Find all predecessors of b that are dominated by b. */
+/* Find all predecessors of b that are dominated by b, i.e. the body of the
+ * natural loop headed by b (without b itself). Walk the predecessor edges
+ * backwards from the latches, staying inside the set of blocks dominated by
+ * b. Each block is pushed at most once, so this is linear in the number of
+ * edges, where the previous fixed-point iteration was quadratic in the
+ * number of blocks and ran for every loop header.
+ */
 static void
 find_all_dominated_predecessors(const bi_context *ctx, bi_block *b,
                                 BITSET_WORD *out, BITSET_WORD *dominators)
@@ -4660,20 +4666,30 @@ find_all_dominated_predecessors(const bi_context *ctx, bi_block *b,
 
    BITSET_CLEAR_COUNT(out, 0, ctx->num_blocks);
 
-   /* If the CFG was one long chain, we would require |blocks|-1 iters to
-    * propagate the in_loop info all the way through.
-    */
-   for (uint32_t iter = 0; iter < ctx->num_blocks - 1; ++iter) {
-      bi_foreach_block(ctx, block) {
-         bi_foreach_successor(block, succ) {
-            if ((succ == b || BITSET_TEST(out, succ->index)) &&
-                BITSET_TEST(dominators, block->index)) {
-               BITSET_SET(out, block->index);
-               break;
-            }
+   bi_block **stack = malloc(ctx->num_blocks * sizeof(bi_block *));
+   unsigned sp = 0;
+
+   bi_foreach_predecessor(b, pred) {
+      if (BITSET_TEST(dominators, (*pred)->index) &&
+          !BITSET_TEST(out, (*pred)->index)) {
+         BITSET_SET(out, (*pred)->index);
+         stack[sp++] = *pred;
+      }
+   }
+
+   while (sp > 0) {
+      bi_block *block = stack[--sp];
+
+      bi_foreach_predecessor(block, pred) {
+         if (*pred != b && BITSET_TEST(dominators, (*pred)->index) &&
+             !BITSET_TEST(out, (*pred)->index)) {
+            BITSET_SET(out, (*pred)->index);
+            stack[sp++] = *pred;
          }
       }
    }
+
+   free(stack);
 }
 
 void
